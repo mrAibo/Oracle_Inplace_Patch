@@ -122,6 +122,17 @@ parse_args() {
         usage
         exit 0
         ;;
+      --prepare-status)    ACTION="prepare_status"  ; shift ;;
+      --prepare-list)      ACTION="prepare_list"    ; shift ;;
+      --prepare-validate)  ACTION="prepare_validate"; shift ;;
+      --unzip)             ACTION="prepare_unzip"
+                         PREPARE_ZIP_FILE="${2:?--unzip: Datei fehlt}"
+                         shift 2 ;;
+      --unzip-all)         ACTION="prepare_unzip_all"
+                           PREPARE_ZIP_DIR="${2:?--unzip-all: Verz. fehlt}"
+                           shift 2 ;;
+      --cleanup-zips)      ACTION="prepare_cleanup_zips"; shift ;;
+      --delete-zips)       PREPARE_DELETE_ZIPS=true; shift ;;
       *)
         log_error "Unbekannte Option: $1"
         usage
