@@ -1,0 +1,149 @@
+# =============================================================================
+# Oracle 19c OOP Patching Framework v3.0 - Beispielkonfiguration
+# =============================================================================
+# Kopieren nach ~/.patchrc und anpassen:
+#   cp etc/patchrc.example ~/.patchrc
+#   vi ~/.patchrc
+#
+# Konfiguration prüfen:
+#   ./oop_patch.sh --config-doctor
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# VERZEICHNISSE
+# -----------------------------------------------------------------------------
+
+# Basis-Verzeichnis wo Patches abgelegt werden
+# Struktur: PATCH_BASE_DIR/<numerische-Patch-ID>/
+PATCH_BASE_DIR_BASE=/work/dba/patching
+
+# Optional: Pro-Hostname-Unterverzeichnis
+# Bei true: PATCH_BASE_DIR = PATCH_BASE_DIR_BASE/$(hostname -s)
+# USE_HOSTNAME_DIR=false
+
+# Oracle Base (übergeordnetes Verzeichnis aller Oracle Homes)
+ORACLE_BASE=/oracle
+
+# Aktuell aktives Oracle Home (vor dem Patching)
+CURRENT_ORACLE_HOME=/oracle/19
+
+# Log-Verzeichnis (wird automatisch erstellt falls nicht vorhanden)
+LOGDIR=/work/dba/patching/logs
+
+# Oracle Central Inventory
+# Wird automatisch aus /etc/oraInst.loc ermittelt wenn nicht gesetzt
+# INVENTORY_LOC=/oracle/oraInventory
+
+# -----------------------------------------------------------------------------
+# BENUTZER & SICHERHEIT
+# -----------------------------------------------------------------------------
+
+# Oracle Software Owner — Skript bricht ab wenn anderer Benutzer aktiv ist
+REQUIRED_USER=ora19
+
+# -----------------------------------------------------------------------------
+# BETRIEBSMODI
+# -----------------------------------------------------------------------------
+
+# Standard-Modus wenn kein Argument angegeben wird
+# Optionen: interactive | test | prod
+DEFAULT_MODE=interactive
+
+# Alle Bestätigungen überspringen (für automatisierten Betrieb)
+# WARNUNG: Nur in kontrollierten Umgebungen verwenden
+UNATTENDED_MODE=false
+
+# Simulationsmodus: keine realen Änderungen, nur Logging
+DRY_RUN=false
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+
+# Log-Level: DEBUG | INFO | WARN | ERROR
+LOG_LEVEL=INFO
+
+# JSON-Abschlussbericht erzeugen
+JSON_REPORT=true
+
+# E-Mail-Benachrichtigung nach Abschluss (leer = keine)
+# Benötigt: mail-Kommando auf dem System
+# NOTIFY_EMAIL=dba@example.com
+
+# -----------------------------------------------------------------------------
+# CLEANUP-POLICY
+# -----------------------------------------------------------------------------
+
+# Alte Oracle Homes bereinigen die älter als N Tage sind
+AUTO_CLEANUP_DAYS=30
+
+# Mindestanzahl Oracle Homes die immer behalten werden
+# (verhindert versehentliches Löschen aller Homes)
+KEEP_HOMES=2
+
+# Automatischen Cleanup ohne Bestätigung erlauben
+# Nur wirksam in Kombination mit UNATTENDED_MODE=true
+ALLOW_AUTO_CLEANUP=false
+
+# Inventory-Eintrag beim Cleanup entfernen
+# WARNUNG: Nur aktivieren wenn Inventory-Konsistenz sichergestellt ist
+ENABLE_INVENTORY_REMOVE=false
+
+# -----------------------------------------------------------------------------
+# PERFORMANCE
+# -----------------------------------------------------------------------------
+
+# Parallele Datapatch-Prozesse
+# 1 = seriell (empfohlen für Produktionssysteme)
+# >1 = parallel (erhöht DB-Last, nur bei ausreichend Ressourcen)
+MAX_PARALLEL_DATAPATCH=1
+
+# Timeout für Datapatch in Sekunden (Standard: 2 Stunden)
+DATAPATCH_TIMEOUT=7200
+
+# Speicher-Puffer-Faktor für Clone-Platzprüfung
+# 1.5 = 50% Puffer über Größe des aktuellen Oracle Home
+SPACE_BUFFER_FACTOR=1.5
+
+# Toleranz für Größenvergleich nach Clone (in Prozent)
+# Warnung wenn Klon um mehr als N% vom Original abweicht
+CLONE_TOLERANCE_PCT=5
+
+# -----------------------------------------------------------------------------
+# SYSTEMLIMITS
+# -----------------------------------------------------------------------------
+
+# Mindest-Limit für offene Dateien (ulimit -n)
+MIN_OPEN_FILES=4096
+
+# Minimum für AUTO_CLEANUP_DAYS (Schutz vor zu aggressivem Cleanup)
+MIN_CLEANUP_DAYS=7
+
+# -----------------------------------------------------------------------------
+# BEISPIELE FÜR VERSCHIEDENE UMGEBUNGEN
+# -----------------------------------------------------------------------------
+
+# --- Entwicklung/Test ---
+# DRY_RUN=false
+# LOG_LEVEL=DEBUG
+# AUTO_CLEANUP_DAYS=7
+# KEEP_HOMES=1
+# MAX_PARALLEL_DATAPATCH=2
+
+# --- Produktion (konservativ) ---
+# DRY_RUN=false
+# LOG_LEVEL=INFO
+# UNATTENDED_MODE=false
+# AUTO_CLEANUP_DAYS=60
+# KEEP_HOMES=3
+# ALLOW_AUTO_CLEANUP=false
+# MAX_PARALLEL_DATAPATCH=1
+# NOTIFY_EMAIL=dba-team@example.com
+
+# --- CI/CD Pipeline ---
+# DRY_RUN=false
+# UNATTENDED_MODE=true
+# ALLOW_AUTO_CLEANUP=true
+# LOG_LEVEL=INFO
+# JSON_REPORT=true
+# MAX_PARALLEL_DATAPATCH=1
