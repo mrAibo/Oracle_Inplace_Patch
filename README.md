@@ -121,16 +121,14 @@ vi ~/.patchrc
 ### Patches vorbereiten
 
 ```bash
-# Patch-Verzeichnis anlegen
-mkdir -p /work/dba/patching
+# 1. ZIPs automatisch vorbereiten
+./oop_patch.sh --unzip-all /downloads/oracle_patches/
 
-# Patch-ZIP entpacken (Beispiel: RU 19.23)
-cd /work/dba/patching
-unzip p35742441_190000_Linux-x86-64.zip
+# 2. Ergebnis prüfen
+./oop_patch.sh --prepare-validate
 
-# Struktur prüfen
-ls /work/dba/patching/
-# 35742441/   ← numerisches Verzeichnis = Patch-ID
+# 3. Patchen
+./oop_patch.sh --prod
 ```
 
 ---
