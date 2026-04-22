@@ -301,6 +301,12 @@ main() {
     interactive)
       _run_interactive_menu
       ;;
+    prepare_status)    action_prepare_status ;;
+    prepare_list)      action_prepare_list ;;
+    prepare_validate)  action_prepare_validate ;;
+    prepare_unzip)     action_prepare_unzip ;;
+    prepare_unzip_all) action_prepare_unzip_all ;;
+    cleanup_zips)      action_prepare_cleanup_zips ;;
     *)
       log_error "Unbekannter Modus: ${MODE}"
       usage
