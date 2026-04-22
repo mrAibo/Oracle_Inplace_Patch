@@ -29,6 +29,7 @@ _load_libs() {
     "lib/rollback.sh"
     "lib/cleanup.sh"
     "lib/report.sh"
+    "lib/prepare.sh"
   )
 
   for lib in "${libs[@]}"; do
