@@ -43,3 +43,34 @@ A live Oracle integration test was not available in this development environment
 ### Next action
 
 Exercise `--test`, controlled `--prod`, `datapatch` verification, connectivity checks, automatic pre-datapatch rollback, and release-specific SQL patch recovery in staging before adopting the script for production maintenance.
+
+## 2026-07-13 — Oracle-server validation harness
+
+### Task
+
+Add a companion script that can validate the patching workflow on an Oracle server without mutating Oracle by default, while retaining an explicitly confirmed path to exercise the existing Home-preparation mode.
+
+### Decisions
+
+- Make the default `--preflight` mode read-only with respect to Oracle, inventory, `/etc/oratab`, and databases; only private reports and the main script's normal validation logs may be written.
+- Reuse the main script's configuration, prerequisite, topology, patch-media, database-discovery, and SQL health-check functions so server validation exercises production code rather than a duplicate implementation.
+- Require the exact confirmation `PREPARE` before invoking the mutating `--test` Home-preparation workflow.
+- Preserve a private transcript and propagate every failed check as a non-zero process exit without printing a success marker.
+- Accept only a non-symlink main script owned by root or the current user and not writable by group/others.
+
+### Files changed
+
+- `oracle_server_validation.sh` — Oracle-server preflight and explicitly confirmed preparation harness.
+- `tests/test_server_validation.sh` — Oracle-independent CLI, non-mutation, failure-propagation, confirmation, and delegation regressions.
+- `README.md` — server usage, safety boundary, report behavior, and verification commands.
+
+### Verification
+
+- `bash -n oracle_oop_patching_2.sh oracle_server_validation.sh tests/test_*.sh`
+- `shellcheck -x -S warning oracle_oop_patching_2.sh oracle_server_validation.sh tests/test_*.sh`
+- `bash tests/test_cli.sh`
+- `bash tests/test_logic.sh`
+- `bash tests/test_server_validation.sh`
+- `git diff --check`
+
+The Oracle-independent suites reported 22 successful scenarios. A real Oracle-server preflight and `--prepare` run remain staging activities because this development host has no Oracle installation.

@@ -46,6 +46,7 @@ Do not place unrelated numeric directories in the patch directory.
 
 ```bash
 chmod 750 oracle_oop_patching_2.sh
+chmod 750 oracle_server_validation.sh
 ./oracle_oop_patching_2.sh --create-config
 chmod 600 ~/.patchrc
 vi ~/.patchrc
@@ -111,15 +112,41 @@ DEFAULT_MODE="interactive"
 
 Listener processes are not restarted automatically because listener names and ownership vary. Verify listener ownership, service registration, connectivity, and application smoke tests after a switch or pre-datapatch rollback. After `datapatch` starts, use the Oracle release-specific SQL patch rollback/recovery procedure rather than switching Homes blindly.
 
+## Oracle-server validation harness
+
+Keep `oracle_server_validation.sh` beside the main script and run it as the configured Oracle software owner. Its default mode performs an Oracle read-only preflight and writes only validation/log files:
+
+```bash
+# Safe default: no Home clone, inventory/oratab change, DB stop, or datapatch
+./oracle_server_validation.sh
+
+# Store the transcript in a selected directory
+./oracle_server_validation.sh --report-dir /work/dba/patching/validation
+
+# Validate another copy of the main script
+./oracle_server_validation.sh --script /path/to/oracle_oop_patching_2.sh
+```
+
+The preflight verifies the main script's ownership, permissions, Bash syntax, and ShellCheck result when ShellCheck is installed. It then loads the normal `~/.patchrc`, checks prerequisites and supported topology, selects and validates RU/OJVM media, discovers active databases from `/etc/oratab`, and runs SQL health checks against the current Home. Grid Infrastructure/Restart, Data Guard, invalid patch media, unhealthy databases, and any other failed check produce a non-zero exit status and no success marker.
+
+To exercise the existing preparation workflow on a **non-production server**, use:
+
+```bash
+./oracle_server_validation.sh --prepare
+```
+
+After a successful preflight, this mode requires the exact interactive confirmation `PREPARE`, then invokes `oracle_oop_patching_2.sh --test`. It clones, registers, and patches a new Oracle Home, so it changes files and inventory; it does **not** switch databases or run `datapatch`. Every invocation stores a private `oracle_validation_*.log` transcript and prints its path, including on failure.
+
 ## Verification
 
 The repository includes Oracle-independent regression tests for CLI behavior, lock ownership, exact `oratab` mutation, rollback-state persistence, cleanup retention/guards, datapatch error propagation, and JSON report escaping.
 
 ```bash
-bash -n oracle_oop_patching_2.sh tests/test_cli.sh tests/test_logic.sh
-shellcheck -x -S warning oracle_oop_patching_2.sh tests/test_cli.sh tests/test_logic.sh
+bash -n oracle_oop_patching_2.sh oracle_server_validation.sh tests/test_*.sh
+shellcheck -x -S warning oracle_oop_patching_2.sh oracle_server_validation.sh tests/test_*.sh
 bash tests/test_cli.sh
 bash tests/test_logic.sh
+bash tests/test_server_validation.sh
 ```
 
 These tests do not replace a staging run against a real Oracle Home and database. Before production, exercise `--test`, a controlled `--prod`, `datapatch` verification, application connectivity, automatic rollback from an induced pre-datapatch switch failure, and the Oracle-documented post-datapatch recovery procedure on a representative non-production host.
