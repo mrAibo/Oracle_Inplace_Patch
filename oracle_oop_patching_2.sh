@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Oracle 19c Out-of-Place Patching Framework
-# Version: 2.0.0
+# Version: 2.1.0
 # =============================================================================
 
 set -euo pipefail
@@ -10,8 +10,9 @@ set -euo pipefail
 # CONSTANTS & CONFIGURATION
 # =============================================================================
 
-readonly SCRIPT_VERSION="2.0.0"
-readonly SCRIPT_NAME=$(basename "$0")
+readonly SCRIPT_VERSION="2.1.0"
+SCRIPT_NAME=$(basename -- "$0")
+readonly SCRIPT_NAME
 readonly MIN_OPEN_FILES=4096
 readonly MIN_CLEANUP_DAYS=7
 readonly CLONE_TOLERANCE_PCT=5
@@ -25,9 +26,11 @@ readonly MAX_PARALLEL_DATAPATCH=4
 # Set umask FIRST before any file creation
 umask 077
 
-LOCK_DIR="/tmp/oracle_patching.lock"
-LOCK_PID_FILE="${LOCK_DIR}/pid"
-CLEANUP_TMPFILE=$(mktemp -t cleanup_candidates.XXXXXX)
+LOCK_DIR="${LOCK_DIR:-}"
+LOCK_PID_FILE=""
+CLEANUP_TMPFILE=""
+LOCK_ACQUIRED=false
+LOCK_OWNER_BASHPID=""
 
 # =============================================================================
 # ERROR HANDLING
@@ -58,10 +61,10 @@ cleanup() {
     local exit_code=$?
     
     # Remove temp file
-    [[ -n "${CLEANUP_TMPFILE}" && -f "${CLEANUP_TMPFILE}" ]] && rm -f "${CLEANUP_TMPFILE}"
+    [[ -n "${CLEANUP_TMPFILE:-}" && -f "${CLEANUP_TMPFILE}" ]] && rm -f "${CLEANUP_TMPFILE}"
     
-    # Remove lock directory
-    if [[ -d "${LOCK_DIR}" ]]; then
+    # Only the process that acquired the lock may release it.
+    if [[ "${LOCK_ACQUIRED}" == "true" && "${BASHPID}" == "${LOCK_OWNER_BASHPID}" && -d "${LOCK_DIR}" ]]; then
         [[ -f "${LOCK_PID_FILE}" ]] && rm -f "${LOCK_PID_FILE}"
         rmdir "${LOCK_DIR}" 2>/dev/null || true
     fi
@@ -102,6 +105,7 @@ ORACLE_BASE="${ORACLE_BASE:-/oracle}"
 CURRENT_ORACLE_HOME="${CURRENT_ORACLE_HOME:-/oracle/19}"
 INVENTORY_LOC="${INVENTORY_LOC:-${AUTO_INVENTORY_LOC:-/oracle/oraInventory}}"
 LOGDIR="${LOGDIR:-/work/dba/patching/logs}"
+PATCH_BASE_DIR="${PATCH_BASE_DIR_BASE}"
 
 # Auto-Cleanup
 AUTO_CLEANUP_DAYS="${AUTO_CLEANUP_DAYS:-30}"
@@ -116,7 +120,8 @@ REQUIRED_USER="${REQUIRED_USER:-ora19}"
 
 # Timestamp & Logging
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOGFILE="${LOGDIR}/oop_patching_${TIMESTAMP}.log"
+LOGFILE=""
+STATE_FILE=""
 DRY_RUN="${DRY_RUN:-false}"
 DATAPATCH_TIMEOUT="${DATAPATCH_TIMEOUT:-7200}"
 
@@ -156,6 +161,11 @@ log() {
     if [[ $(log_level_num "${level}") -lt $(log_level_num "${LOG_LEVEL}") ]]; then
         return 0
     fi
+
+    if [[ -z "${LOGFILE:-}" ]]; then
+        echo -e "${timestamp} [${level}] ${message}"
+        return 0
+    fi
     
     # Ensure log directory exists
     if [[ ! -d "${LOGDIR}" ]]; then
@@ -184,67 +194,59 @@ die() {
 }
 
 # =============================================================================
-# COMMAND EXECUTION WRAPPER
-# =============================================================================
-
-execute_cmd() {
-    local description="$1"
-    shift
-    
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[DRY-RUN] ${description}"
-        log_debug "[DRY-RUN] Command: $*"
-        return 0
-    fi
-    
-    log_info "${description}"
-    "$@"
-}
-
-# =============================================================================
 # CONFIG-FILE HANDLING
 # =============================================================================
 
 validate_config() {
     local errors=0
-    
-    [[ -z "${ORACLE_BASE}" ]] && { log_error "ORACLE_BASE nicht konfiguriert"; ((errors++)); }
-    [[ -z "${CURRENT_ORACLE_HOME}" ]] && { log_error "CURRENT_ORACLE_HOME nicht konfiguriert"; ((errors++)); }
-    [[ ! -d "${ORACLE_BASE}" ]] && { log_error "ORACLE_BASE existiert nicht: ${ORACLE_BASE}"; ((errors++)); }
-    [[ ! -d "${CURRENT_ORACLE_HOME}" ]] && { log_error "CURRENT_ORACLE_HOME existiert nicht: ${CURRENT_ORACLE_HOME}"; ((errors++)); }
-    
-    if [[ ${AUTO_CLEANUP_DAYS} -lt ${MIN_CLEANUP_DAYS} ]]; then
-        log_warn "AUTO_CLEANUP_DAYS < ${MIN_CLEANUP_DAYS} ist riskant (aktuell: ${AUTO_CLEANUP_DAYS})"
+
+    [[ -z "${ORACLE_BASE}" ]] && { log_error "ORACLE_BASE nicht konfiguriert"; errors=$((errors + 1)); }
+    [[ -z "${CURRENT_ORACLE_HOME}" ]] && { log_error "CURRENT_ORACLE_HOME nicht konfiguriert"; errors=$((errors + 1)); }
+    [[ ! -d "${ORACLE_BASE}" ]] && { log_error "ORACLE_BASE existiert nicht: ${ORACLE_BASE}"; errors=$((errors + 1)); }
+    [[ ! -d "${CURRENT_ORACLE_HOME}" ]] && { log_error "CURRENT_ORACLE_HOME existiert nicht: ${CURRENT_ORACLE_HOME}"; errors=$((errors + 1)); }
+
+    [[ ! "${AUTO_CLEANUP_DAYS}" =~ ^[0-9]+$ ]] && { log_error "AUTO_CLEANUP_DAYS muss eine ganze Zahl sein"; errors=$((errors + 1)); }
+    [[ ! "${KEEP_HOMES}" =~ ^[0-9]+$ || "${KEEP_HOMES}" -lt 1 ]] && { log_error "KEEP_HOMES muss mindestens 1 sein"; errors=$((errors + 1)); }
+    [[ ! "${DATAPATCH_TIMEOUT}" =~ ^[0-9]+$ || "${DATAPATCH_TIMEOUT}" -lt 1 ]] && { log_error "DATAPATCH_TIMEOUT muss mindestens 1 sein"; errors=$((errors + 1)); }
+    [[ ! "${DRY_RUN}" =~ ^(true|false)$ ]] && { log_error "DRY_RUN muss true oder false sein"; errors=$((errors + 1)); }
+    [[ ! "${UNATTENDED_MODE}" =~ ^(true|false)$ ]] && { log_error "UNATTENDED_MODE muss true oder false sein"; errors=$((errors + 1)); }
+    [[ ! "${DEFAULT_MODE}" =~ ^(interactive|test|prod)$ ]] && { log_error "DEFAULT_MODE muss interactive, test oder prod sein"; errors=$((errors + 1)); }
+
+    if [[ "${AUTO_CLEANUP_DAYS}" =~ ^[0-9]+$ && ${AUTO_CLEANUP_DAYS} -lt ${MIN_CLEANUP_DAYS} ]]; then
+        log_error "AUTO_CLEANUP_DAYS muss mindestens ${MIN_CLEANUP_DAYS} sein"
+        errors=$((errors + 1))
     fi
-    
+
     [[ ${errors} -gt 0 ]] && return 1
     return 0
 }
 
 load_config() {
     if [[ -f "${PATCHRC}" ]]; then
-        log_info "Loading configuration from ${PATCHRC}"
-        
+        [[ -O "${PATCHRC}" && ! -L "${PATCHRC}" ]] || die "Config must be an owned regular file, not a symlink: ${PATCHRC}"
+        local config_mode
+        config_mode=$(stat -c '%a' "${PATCHRC}") || die "Could not inspect config permissions: ${PATCHRC}"
+        if (( (8#${config_mode} & 8#22) != 0 )); then
+            die "Config must not be writable by group or others: ${PATCHRC}"
+        fi
+
         # Syntax check before loading
         if ! bash -n "${PATCHRC}" 2>/dev/null; then
             die "Konfigurationsdatei ${PATCHRC} hat Syntaxfehler!"
         fi
-        
+
         # shellcheck source=/dev/null
         source "${PATCHRC}"
 
         if [[ -z "${INVENTORY_LOC}" ]] && [[ -n "${AUTO_INVENTORY_LOC}" ]]; then
             INVENTORY_LOC="${AUTO_INVENTORY_LOC}"
         fi
-    else
-        log_info "No config file found, using defaults"
     fi
-    
-    # Validate after loading
-    validate_config || die "Konfigurationsvalidierung fehlgeschlagen"
 }
 
 create_default_config() {
+    [[ ! -e "${PATCHRC}" ]] || die "Config already exists and will not be overwritten: ${PATCHRC}"
+
     local detected_inv=""
     if [[ -f /etc/oraInst.loc ]]; then
         detected_inv=$(awk -F'=' '/inventory_loc/{print $2}' /etc/oraInst.loc | tr -d ' ')
@@ -288,10 +290,10 @@ LOGDIR="/work/dba/patching/logs"
 # AUTO-CLEANUP EINSTELLUNGEN
 # ============================================================================
 
-# Nach wie vielen Tagen werden alte Homes automatisch aufgeräumt?
+# Altersgrenze für expliziten Cleanup (--cleanup); nie während --prod automatisch
 AUTO_CLEANUP_DAYS=30
 
-# Wie viele Homes parallel behalten (aktuell + Rollback)?
+# Anzahl der neuesten Homes, die Cleanup immer behält (aktuell + Rollback)
 KEEP_HOMES=2
 
 # ============================================================================
@@ -307,6 +309,9 @@ DEFAULT_MODE="interactive"
 # false = Bestätigungen erforderlich (empfohlen für manuelle Ausführung)
 UNATTENDED_MODE="false"
 
+# Nur validieren und geplante Aktionen anzeigen; keine Änderungen
+DRY_RUN="false"
+
 # ============================================================================
 # SYSTEM
 # ============================================================================
@@ -316,13 +321,6 @@ REQUIRED_USER="ora19"
 
 # Datapatch Timeout in Sekunden
 DATAPATCH_TIMEOUT=7200
-
-# ============================================================================
-# BENACHRICHTIGUNGEN (optional)
-# ============================================================================
-
-# E-Mail für Notifications nach Abschluss (leer = keine Mails)
-NOTIFY_EMAIL=""
 
 EOF
 
@@ -336,23 +334,31 @@ EOF
 
 acquire_lock() {
     if [[ -d "${LOCK_DIR}" ]]; then
+        [[ -O "${LOCK_DIR}" && ! -L "${LOCK_DIR}" ]] || die "Lock-Verzeichnis ist nicht sicher/eigen: ${LOCK_DIR}"
+        local locked_pid=""
         if [[ -f "${LOCK_PID_FILE}" ]]; then
-            local locked_pid
+            [[ -O "${LOCK_PID_FILE}" && ! -L "${LOCK_PID_FILE}" ]] || die "Lock-PID-Datei ist nicht sicher/eigen: ${LOCK_PID_FILE}"
             locked_pid=$(cat "${LOCK_PID_FILE}" 2>/dev/null || echo "")
-            
-            if [[ -n "${locked_pid}" ]] && kill -0 "${locked_pid}" 2>/dev/null; then
-                log_error "Skript läuft bereits (PID: ${locked_pid})"
-                exit 1
-            else
-                log_warn "Entferne verwaistes Lock (PID ${locked_pid} nicht mehr aktiv)"
-                rm -rf "${LOCK_DIR}"
-            fi
         fi
+
+        if [[ "${locked_pid}" =~ ^[0-9]+$ ]] && kill -0 "${locked_pid}" 2>/dev/null; then
+            die "Skript läuft bereits (PID: ${locked_pid})"
+        fi
+
+        log_warn "Entferne verwaistes Lock${locked_pid:+ (PID: ${locked_pid})}"
+        rm -f -- "${LOCK_PID_FILE}"
+        rmdir -- "${LOCK_DIR}" 2>/dev/null || die "Lock-Verzeichnis ist nicht leer oder nicht entfernbar: ${LOCK_DIR}"
     fi
-    
+
     mkdir "${LOCK_DIR}" 2>/dev/null || die "Konnte Lock-Verzeichnis nicht erstellen: ${LOCK_DIR}"
-    echo $$ > "${LOCK_PID_FILE}"
-    
+    if ! chmod 700 "${LOCK_DIR}" || ! printf '%s\n' "$$" > "${LOCK_PID_FILE}"; then
+        rm -f -- "${LOCK_PID_FILE}"
+        rmdir -- "${LOCK_DIR}" 2>/dev/null || true
+        die "Konnte Lock nicht sicher initialisieren: ${LOCK_DIR}"
+    fi
+    LOCK_ACQUIRED=true
+    LOCK_OWNER_BASHPID="${BASHPID}"
+
     log_debug "Lock acquired (PID: $$)"
 }
 
@@ -365,8 +371,9 @@ read_databases_from_oratab() {
     local oracle_home="$1"
     local -n result_array=$2
     
+    # shellcheck disable=SC2034 # populated through the nameref output parameter
     mapfile -t result_array < <(
-        grep -E "^[^#].*:${oracle_home}:" /etc/oratab 2>/dev/null | cut -d':' -f1 || true
+        awk -F: -v home="${oracle_home}" 'NF >= 2 && $1 ~ /^[[:alnum:]_$#]+$/ && $1 != "*" && $2 == home { print $1 }' /etc/oratab 2>/dev/null || true
     )
 }
 
@@ -377,7 +384,7 @@ get_home_version() {
     
     # Method 1: sqlplus -V (most reliable, no DB connection needed)
     if [[ -x "${oracle_home}/bin/sqlplus" ]]; then
-        version=$("${oracle_home}/bin/sqlplus" -V 2>/dev/null | awk '/^Version/{print $2}')
+        version=$("${oracle_home}/bin/sqlplus" -V 2>/dev/null | awk '/^Version/{print $2}' || true)
         if [[ -n "${version}" ]]; then
             echo "${version}"
             return 0
@@ -387,7 +394,7 @@ get_home_version() {
     # Method 2: opatch lspatches (extract from RU patch description)
     if [[ -x "${oracle_home}/OPatch/opatch" ]]; then
         version=$("${oracle_home}/OPatch/opatch" lspatches 2>/dev/null | \
-                  grep -oE "19\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+                  grep -oE "19\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1 || true)
         if [[ -n "${version}" ]]; then
             echo "${version}"
             return 0
@@ -407,6 +414,7 @@ get_db_status() {
     export ORACLE_SID="${db_sid}"
     
     "${db_home}/bin/sqlplus" -s / as sysdba 2>/dev/null <<'EOF'
+whenever sqlerror exit failure
 set heading off feedback off pagesize 0
 SELECT status FROM v$instance;
 EXIT;
@@ -422,6 +430,7 @@ get_db_version() {
     export ORACLE_SID="${db_sid}"
     
     "${db_home}/bin/sqlplus" -s / as sysdba 2>/dev/null <<'EOF'
+whenever sqlerror exit failure
 set heading off feedback off pagesize 0
 SELECT version_full FROM v$instance;
 EXIT;
@@ -437,6 +446,7 @@ get_invalid_count() {
     export ORACLE_SID="${db_sid}"
     
     "${db_home}/bin/sqlplus" -s / as sysdba 2>/dev/null <<'EOF'
+whenever sqlerror exit failure
 set heading off feedback off pagesize 0
 SELECT COUNT(*) FROM dba_objects WHERE status='INVALID';
 EXIT;
@@ -473,21 +483,40 @@ get_home_age_days() {
 # INITIALIZATION
 # =============================================================================
 
-# Ensure log directory exists
-mkdir -p "${LOGDIR}" 2>/dev/null || true
+INITIALIZED=false
 
-# Load config first
-load_config
+initialize() {
+    [[ "${INITIALIZED}" == "true" ]] && return 0
 
-# Apply hostname-based directory if enabled
-if [[ "${USE_HOSTNAME_DIR}" == "true" ]]; then
-    PATCH_BASE_DIR="${PATCH_BASE_DIR_BASE}/$(hostname -s)"
-else
-    PATCH_BASE_DIR="${PATCH_BASE_DIR_BASE}"
-fi
+    load_config
 
-# Make critical variables readonly after initialization
-readonly ORACLE_BASE CURRENT_ORACLE_HOME INVENTORY_LOC PATCH_BASE_DIR LOGDIR REQUIRED_USER
+    if [[ "${USE_HOSTNAME_DIR}" == "true" ]]; then
+        PATCH_BASE_DIR="${PATCH_BASE_DIR_BASE}/$(hostname -s)"
+    else
+        PATCH_BASE_DIR="${PATCH_BASE_DIR_BASE}"
+    fi
+
+    LOGFILE="${LOGDIR}/oop_patching_${TIMESTAMP}.log"
+    STATE_FILE="${LOGDIR}/oop_patching_state"
+    LOCK_DIR="${LOCK_DIR:-${ORACLE_BASE}/.oracle_patching.lock}"
+    LOCK_PID_FILE="${LOCK_DIR}/pid"
+    if ! mkdir -p "${LOGDIR}" 2>/dev/null || [[ ! -w "${LOGDIR}" ]]; then
+        printf 'Log directory is not writable: %s\n' "${LOGDIR}" >&2
+        exit 1
+    fi
+    if ! CLEANUP_TMPFILE=$(mktemp -t cleanup_candidates.XXXXXX); then
+        printf 'Could not create cleanup temporary file\n' >&2
+        exit 1
+    fi
+    if ! touch "${LOGFILE}"; then
+        printf 'Could not create log file: %s\n' "${LOGFILE}" >&2
+        exit 1
+    fi
+
+    validate_config || die "Konfigurationsvalidierung fehlgeschlagen"
+    INITIALIZED=true
+    log_info "Configuration loaded${PATCHRC:+ (${PATCHRC})}"
+}
 
 # Declare global arrays
 declare -a DATABASES=()
@@ -495,6 +524,9 @@ declare -a DATAPATCH_PIDS=()
 
 # Global patch variables
 NEW_ORACLE_HOME=""
+OLD_ORACLE_HOME=""
+ORATAB_BACKUP=""
+PATCH_PHASE="PREPARE"
 RU_PATCH_DIR=""
 RU_PATCH_NUM=""
 NEW_PATCH_VERSION=""
@@ -505,7 +537,6 @@ OJVM_PATCH_NUM=""
 # =============================================================================
 # STATUS OVERVIEW
 # =============================================================================
-get_home_version "/oracle/19"
 show_status() {
     log_info "=== Oracle Patching Status Overview ==="
     echo ""
@@ -692,25 +723,49 @@ find_old_homes() {
         return 0
     fi
 
-    # Reset temp file
-    > "${CLEANUP_TMPFILE}"
+    : > "${CLEANUP_TMPFILE}"
 
     local homes
-    homes=$(grep -oP '(?<=LOC=")[^"]+' "${INVENTORY_LOC}/ContentsXML/inventory.xml" 2>/dev/null || echo "")
+    homes=$(awk '
+        {
+            line = $0
+            while (match(line, /LOC="[^"]+"/)) {
+                print substr(line, RSTART + 5, RLENGTH - 6)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "${INVENTORY_LOC}/ContentsXML/inventory.xml" 2>/dev/null || true)
 
-    # Skip if no homes found
     if [[ -z "${homes}" ]]; then
-        echo -e "  ${GREEN}✓ No cleanup candidates found${NC}" 
+        echo -e "  ${GREEN}✓ No cleanup candidates found${NC}"
         return 0
     fi
 
+    local -a sorted_homes=()
+    local canonical_base
+    canonical_base=$(realpath -e -- "${ORACLE_BASE}" 2>/dev/null) || return 0
+    mapfile -t sorted_homes < <(
+        while IFS= read -r home; do
+            home=$(realpath -e -- "${home}" 2>/dev/null || true)
+            [[ -n "${home}" && "${home}" == "${canonical_base}/"* ]] || continue
+            [[ -f "${home}/bin/oracle" ]] || continue
+            printf '%s\t%s\n' "$(stat -c %Y "${home}" 2>/dev/null || echo 0)" "${home}"
+        done <<< "${homes}" | sort -u -k2,2 | sort -rn -k1,1 | cut -f2-
+    )
+
     local found_candidates=false
+    local position=0
+    local home
+    for home in "${sorted_homes[@]}"; do
+        position=$((position + 1))
 
-    while IFS= read -r home; do
-        [[ -z "${home}" ]] && continue
+        # Always retain the newest configured number of homes.
+        if [[ ${position} -le ${KEEP_HOMES} ]]; then
+            continue
+        fi
 
-        # Check if home is in oratab (active)
-        if grep -q "${home}" /etc/oratab 2>/dev/null; then
+        # Never offer a home still referenced by oratab.
+        if awk -F: -v candidate="${home}" 'NF >= 2 && $1 !~ /^#/ && $2 == candidate { found=1 } END { exit !found }' /etc/oratab 2>/dev/null; then
             continue
         fi
 
@@ -725,7 +780,7 @@ find_old_homes() {
             echo "${home}" >> "${CLEANUP_TMPFILE}"
             found_candidates=true
         fi
-    done <<< "${homes}"
+    done
 
     if [[ "${found_candidates}" == "false" ]]; then
         echo -e "  ${GREEN}✓ No cleanup candidates found${NC}"
@@ -749,70 +804,110 @@ auto_cleanup() {
     mapfile -t candidates < "${CLEANUP_TMPFILE}"
     
     # Reset temp file after reading
-    > "${CLEANUP_TMPFILE}"
+    : > "${CLEANUP_TMPFILE}"
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
         log_success "No homes to cleanup"
         return 0
     fi
 
+    local cleanup_failures=0
     for old_home in "${candidates[@]}"; do
         log_info "Cleaning up: ${old_home}"
-        cleanup_single_home "${old_home}" --auto
+        if ! cleanup_single_home "${old_home}" --auto; then
+            cleanup_failures=$((cleanup_failures + 1))
+            log_warn "Cleanup skipped after safety check failure: ${old_home}"
+        fi
     done
+
+    if [[ ${cleanup_failures} -gt 0 ]]; then
+        die "Cleanup completed with ${cleanup_failures} safety-check failure(s)"
+    fi
 }
 
 cleanup_single_home() {
     local old_home="$1"
     local auto_mode="${2:-}"
-    
-    # Input validation
+    local canonical_home canonical_base
+
     [[ -z "${old_home}" ]] && die "Kein Home angegeben"
-    [[ "${old_home}" == "/" ]] && die "Root-Pfad nicht erlaubt"
-    [[ ! "${old_home}" =~ ^/oracle ]] && die "Nur /oracle-Pfade erlaubt für Cleanup"
-    [[ ! -d "${old_home}" ]] && { log_error "Home existiert nicht: ${old_home}"; return 1; }
+    command -v realpath >/dev/null 2>&1 || die "Required tool 'realpath' is not installed"
+    canonical_home=$(realpath -e -- "${old_home}" 2>/dev/null) || { log_error "Home existiert nicht: ${old_home}"; return 1; }
+    canonical_base=$(realpath -e -- "${ORACLE_BASE}" 2>/dev/null) || die "ORACLE_BASE ist ungültig: ${ORACLE_BASE}"
+    old_home="${canonical_home}"
+
+    [[ "${old_home}" == "${canonical_base}" ]] && die "ORACLE_BASE selbst darf nicht gelöscht werden"
+    [[ "${old_home}" == "${canonical_base}/"* ]] || die "Cleanup ist nur innerhalb von ORACLE_BASE erlaubt: ${canonical_base}"
+    [[ "${old_home}" == "$(realpath -e -- "${CURRENT_ORACLE_HOME}" 2>/dev/null || true)" ]] && die "Aktuelles Oracle Home darf nicht gelöscht werden"
     [[ ! -f "${old_home}/bin/oracle" ]] && { log_error "Kein gültiges Oracle Home: ${old_home}"; return 1; }
 
-    # Check for running databases
-    local running_dbs
-    running_dbs=$(pgrep -f "ora_pmon.*${old_home}" 2>/dev/null | wc -l || echo "0")
-
-    if [[ ${running_dbs} -gt 0 ]]; then
-        log_error "Databases still running from ${old_home}! Skipping cleanup."
+    if awk -F: -v candidate="${old_home}" 'NF >= 2 && $1 !~ /^#/ && $2 == candidate { found=1 } END { exit !found }' /etc/oratab 2>/dev/null; then
+        log_error "Oracle Home wird noch in /etc/oratab verwendet: ${old_home}"
         return 1
     fi
+
+    local proc pid executable
+    for proc in /proc/[0-9]*; do
+        pid=${proc##*/}
+        executable=$(readlink -f "${proc}/exe" 2>/dev/null || true)
+        if [[ "${executable}" == "${old_home}/"* ]]; then
+            log_error "Ein laufender Prozess verwendet noch ${old_home} (PID: ${pid}, executable: ${executable})"
+            return 1
+        fi
+    done
 
     local home_age_days
     home_age_days=$(get_home_age_days "${old_home}")
 
-    if [[ "${auto_mode}" != "--auto" ]]; then
-        log_warn "Home: ${old_home}"
-        log_warn "Age: ${home_age_days} days"
-        read -p "Delete this home? (yes/no): " confirm
+    if [[ "${auto_mode}" == "--auto" && ${home_age_days} -lt ${AUTO_CLEANUP_DAYS} ]]; then
+        log_error "Home ist erst ${home_age_days} Tage alt; Minimum: ${AUTO_CLEANUP_DAYS}"
+        return 1
+    fi
 
-        if [[ "${confirm}" != "yes" ]]; then
-            log_info "Cleanup skipped"
-            return 0
-        fi
+    log_warn "Home: ${old_home}"
+    log_warn "Age: ${home_age_days} days"
+    local confirm
+    read -r -p "Delete this home? Type yes to continue: " confirm
+
+    if [[ "${confirm}" != "yes" ]]; then
+        log_info "Cleanup skipped"
+        return 0
     fi
 
     log_info "Starting cleanup of ${old_home}..."
 
-    if [[ -x "${old_home}/deinstall/deinstall" ]]; then
-        log_info "Running deinstall..."
-        export ORACLE_HOME="${old_home}"
-        echo -e "yes\n" | "${old_home}/deinstall/deinstall" -silent 2>&1 | tee -a "${LOGFILE}" || true
-    fi
+    local inventory_xml="${INVENTORY_LOC}/ContentsXML/inventory.xml"
+    if [[ -f "${inventory_xml}" ]] && grep -Fq "LOC=\"${old_home}\"" "${inventory_xml}"; then
+        [[ -x "${old_home}/oui/bin/runInstaller" ]] || {
+            log_error "runInstaller fehlt; Inventory wird nicht manuell verändert"
+            return 1
+        }
 
-    if grep -q "${old_home}" "${INVENTORY_LOC}/ContentsXML/inventory.xml" 2>/dev/null; then
-        log_info "Removing from inventory..."
-        cp "${INVENTORY_LOC}/ContentsXML/inventory.xml" \
-           "${INVENTORY_LOC}/ContentsXML/inventory.xml.bak_${TIMESTAMP}"
-        sed -i "\|${old_home}|d" "${INVENTORY_LOC}/ContentsXML/inventory.xml"
+        log_info "Detaching Oracle Home from inventory..."
+        local inventory_backup
+        if ! inventory_backup=$(mktemp "${LOGDIR}/inventory.xml.bak.XXXXXX"); then
+            log_error "Could not allocate Oracle Inventory backup; cleanup aborted"
+            return 1
+        fi
+        if ! cp --preserve=mode,timestamps -- "${inventory_xml}" "${inventory_backup}"; then
+            rm -f -- "${inventory_backup}"
+            log_error "Could not back up Oracle Inventory; cleanup aborted"
+            return 1
+        fi
+        log_info "Inventory backup: ${inventory_backup}"
+        if ! "${old_home}/oui/bin/runInstaller" -silent -detachHome ORACLE_HOME="${old_home}" 2>&1 | tee -a "${LOGFILE}"; then
+            log_error "Inventory detach failed; directory is preserved"
+            return 1
+        fi
+
+        if grep -Fq "LOC=\"${old_home}\"" "${inventory_xml}"; then
+            log_error "Oracle Home is still present in inventory; directory is preserved"
+            return 1
+        fi
     fi
 
     log_info "Removing directory ${old_home}..."
-    rm -rf "${old_home}"
+    rm -rf -- "${old_home}"
 
     log_success "Cleanup completed: ${old_home}"
 }
@@ -838,9 +933,15 @@ check_prerequisites() {
 
     # Disk Space with buffer
     local required_space available_space
-    required_space=$(du -sb "${CURRENT_ORACLE_HOME}" 2>/dev/null | \
-                     awk -v factor="${SPACE_BUFFER_FACTOR}" '{print int($1 * factor / 1024 / 1024)}')
-    available_space=$(df -m "${ORACLE_BASE}" 2>/dev/null | tail -1 | awk '{print $4}')
+    if ! required_space=$(du -sb "${CURRENT_ORACLE_HOME}" 2>/dev/null | \
+        awk -v factor="${SPACE_BUFFER_FACTOR}" '{print int($1 * factor / 1024 / 1024)}') ||
+       ! [[ "${required_space}" =~ ^[0-9]+$ ]]; then
+        die "Could not calculate required disk space"
+    fi
+    if ! available_space=$(df -Pm "${ORACLE_BASE}" 2>/dev/null | awk 'NR == 2 {print $4}') ||
+       ! [[ "${available_space}" =~ ^[0-9]+$ ]]; then
+        die "Could not determine available disk space in ${ORACLE_BASE}"
+    fi
     
     log_info "Required space: ~${required_space} MB, Available: ${available_space} MB"
     
@@ -856,7 +957,7 @@ check_prerequisites() {
     fi
 
     # Check required tools
-    local required_tools=("rsync" "unzip")
+    local required_tools=("rsync" "unzip" "realpath" "timeout" "stdbuf")
     for tool in "${required_tools[@]}"; do
         if ! command -v "${tool}" &> /dev/null; then
             die "Required tool '${tool}' is not installed"
@@ -876,6 +977,50 @@ check_prerequisites() {
     fi
 
     log_success "All prerequisites met"
+}
+
+check_supported_topology() {
+    local crs_home=""
+    if [[ -r /etc/oracle/olr.loc ]]; then
+        crs_home=$(awk -F= '$1 == "crs_home" { print $2; exit }' /etc/oracle/olr.loc | tr -d '[:space:]')
+    fi
+    if [[ -n "${crs_home}" && -x "${crs_home}/bin/crsctl" ]]; then
+        die "Oracle Grid Infrastructure/Restart detected (${crs_home}); use an srvctl-aware patching workflow"
+    fi
+
+    local -a topology_databases=()
+    local db topology role standby_destinations
+    read_databases_from_oratab "${CURRENT_ORACLE_HOME}" topology_databases
+    [[ ${#topology_databases[@]} -gt 0 ]] || die "No databases found for topology validation"
+
+    for db in "${topology_databases[@]}"; do
+        export ORACLE_HOME="${CURRENT_ORACLE_HOME}"
+        export ORACLE_SID="${db}"
+        if ! topology=$("${CURRENT_ORACLE_HOME}/bin/sqlplus" -s / as sysdba 2>/dev/null <<'EOF'
+whenever sqlerror exit failure
+set heading off feedback off pagesize 0
+SELECT database_role || ':' ||
+       (SELECT COUNT(*) FROM v$archive_dest
+        WHERE target = 'STANDBY')
+FROM v$database;
+exit;
+EOF
+        ); then
+            die "Could not validate database topology for ${db}"
+        fi
+
+        topology=$(tr -d '[:space:]' <<< "${topology}")
+        role=${topology%%:*}
+        standby_destinations=${topology#*:}
+        if [[ "${role}" != "PRIMARY" || ! "${standby_destinations}" =~ ^[0-9]+$ ]]; then
+            die "Unsupported or indeterminate database role for ${db}: ${topology:-empty}"
+        fi
+        if [[ ${standby_destinations} -gt 0 ]]; then
+            die "Data Guard configuration detected for ${db}; coordinated standby patching is required"
+        fi
+    done
+
+    log_success "Supported standalone single-instance topology confirmed"
 }
 
 # =============================================================================
@@ -924,67 +1069,83 @@ select_patch() {
     log_info "=== Detecting Patches ==="
 
     local -a patch_options=()
-    mapfile -t patch_options < <(
-        find "${PATCH_BASE_DIR}" -maxdepth 1 -type d -name "[0-9]*" -printf "%f\n" 2>/dev/null | sort -V || true
-    )
+    local -a ojvm_candidates=()
+    local -A patch_versions=()
+    local patch_dir patch_readme patch_id patch_version opt
+
+    while IFS= read -r patch_dir; do
+        patch_readme="${patch_dir}/README.txt"
+        [[ -f "${patch_readme}" ]] || continue
+
+        if grep -Eqi 'OJVM|Oracle JavaVM' "${patch_readme}"; then
+            ojvm_candidates+=("${patch_dir}")
+        elif grep -Eqi 'Oracle Database Release Update|Database Release Update|Release Update.*19c' "${patch_readme}"; then
+            patch_id=$(basename "${patch_dir}")
+            patch_version=$(grep -oE "19\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "${patch_readme}" 2>/dev/null | sort -V | tail -1 || true)
+            if [[ -n "${patch_version}" ]]; then
+                patch_options+=("${patch_id}")
+                patch_versions["${patch_id}"]="${patch_version}"
+            else
+                log_warn "Ignoring RU candidate without a 19c target version: ${patch_dir}"
+            fi
+        fi
+    done < <(find "${PATCH_BASE_DIR}" -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | sort -V || true)
 
     if [[ ${#patch_options[@]} -eq 0 ]]; then
-        die "No Release Update patches found in ${PATCH_BASE_DIR}"
+        die "No verified Database Release Update patches found in ${PATCH_BASE_DIR}"
     fi
 
     if [[ "${UNATTENDED_MODE:-false}" == "true" ]]; then
-        # Select latest patch
-        RU_PATCH_DIR="${PATCH_BASE_DIR}/${patch_options[-1]}"
+        patch_id=$(
+            for patch_id in "${patch_options[@]}"; do
+                printf '%s\t%s\n' "${patch_versions[${patch_id}]}" "${patch_id}"
+            done | sort -V -k1,1 | tail -1 | cut -f2
+        )
+        RU_PATCH_DIR="${PATCH_BASE_DIR}/${patch_id}"
     else
         echo ""
-        echo "Available patches in ${PATCH_BASE_DIR}:"
-        select opt in "${patch_options[@]}" "Abbruch"; do
-            case $opt in
-                "Abbruch") exit 0 ;;
-                "") echo "Ungültige Auswahl" ;;
-                *) RU_PATCH_DIR="${PATCH_BASE_DIR}/${opt}"; break ;;
-            esac
+        echo "Available Database Release Updates in ${PATCH_BASE_DIR}:"
+        local -a patch_labels=()
+        for patch_id in "${patch_options[@]}"; do
+            patch_labels+=("${patch_id} (${patch_versions[${patch_id}]})")
+        done
+        select opt in "${patch_labels[@]}" "Abbruch"; do
+            if [[ "${opt}" == "Abbruch" ]]; then
+                exit 0
+            fi
+            if [[ -z "${opt}" ]]; then
+                echo "Ungültige Auswahl"
+                continue
+            fi
+            patch_id=${patch_options[REPLY-1]}
+            RU_PATCH_DIR="${PATCH_BASE_DIR}/${patch_id}"
+            break
         done
     fi
 
     RU_PATCH_NUM=$(basename "${RU_PATCH_DIR}")
+    NEW_PATCH_VERSION="${patch_versions[${RU_PATCH_NUM}]}"
     log_info "Selected RU Patch: ${RU_PATCH_NUM}"
-
-    local readme="${RU_PATCH_DIR}/README.txt"
-    if [[ -f "${readme}" ]]; then
-        NEW_PATCH_VERSION=$(grep -oE "19\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "${readme}" 2>/dev/null | \
-                           head -1 || echo "19.UNKNOWN")
-    else
-        NEW_PATCH_VERSION="19.UNKNOWN"
-        log_warn "README.txt not found, using version: ${NEW_PATCH_VERSION}"
-    fi
-
     log_info "Target Version: ${NEW_PATCH_VERSION}"
 
-    # Find OPatch update
-    OPATCH_ZIP=$(find "${PATCH_BASE_DIR}" -maxdepth 1 -type f -name "p6880880*.zip" 2>/dev/null | head -1 || true)
+    OPATCH_ZIP=$(find "${PATCH_BASE_DIR}" -maxdepth 1 -type f -name "p6880880*.zip" 2>/dev/null | sort -V | tail -1 || true)
     [[ -n "${OPATCH_ZIP}" ]] && log_info "Found OPatch Update: $(basename "${OPATCH_ZIP}")"
 
-    # Find OJVM patch
     OJVM_PATCH_DIR=""
     OJVM_PATCH_NUM=""
-    
-    local -a all_patch_dirs=()
-    mapfile -t all_patch_dirs < <(find "${PATCH_BASE_DIR}" -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null || true)
-    
-    for patch_dir in "${all_patch_dirs[@]}"; do
-        local patch_readme="${patch_dir}/README.txt"
-        if [[ -f "${patch_readme}" ]] && grep -q "OJVM" "${patch_readme}" 2>/dev/null; then
+    for patch_dir in "${ojvm_candidates[@]}"; do
+        patch_readme="${patch_dir}/README.txt"
+        if grep -Fq "${NEW_PATCH_VERSION}" "${patch_readme}"; then
             OJVM_PATCH_DIR="${patch_dir}"
             OJVM_PATCH_NUM=$(basename "${patch_dir}")
-            log_info "Detected OJVM Patch: ${OJVM_PATCH_NUM}"
-            break
         fi
     done
-}
 
-detect_patches() {
-    select_patch
+    if [[ -n "${OJVM_PATCH_DIR}" ]]; then
+        log_info "Detected matching OJVM Patch: ${OJVM_PATCH_NUM}"
+    elif [[ ${#ojvm_candidates[@]} -gt 0 ]]; then
+        log_warn "OJVM patches exist, but none matches RU version ${NEW_PATCH_VERSION}; skipping OJVM"
+    fi
 }
 
 # =============================================================================
@@ -1000,11 +1161,18 @@ clone_oracle_home() {
     log_info "Target: ${NEW_ORACLE_HOME}"
 
     local required_space available_space
-    required_space=$(du -sb "${CURRENT_ORACLE_HOME}" 2>/dev/null | \
-                     awk -v factor="${SPACE_BUFFER_FACTOR}" '{print int($1 * factor / 1024 / 1024)}')
-    available_space=$(df -m "${ORACLE_BASE}" 2>/dev/null | tail -1 | awk '{print $4}')
+    if ! required_space=$(du -sb "${CURRENT_ORACLE_HOME}" 2>/dev/null | \
+        awk -v factor="${SPACE_BUFFER_FACTOR}" '{print int($1 * factor / 1024 / 1024)}') ||
+       ! [[ "${required_space}" =~ ^[0-9]+$ ]]; then
+        die "Could not calculate clone size"
+    fi
+    if ! available_space=$(df -Pm "${ORACLE_BASE}" 2>/dev/null | awk 'NR == 2 {print $4}') ||
+       ! [[ "${available_space}" =~ ^[0-9]+$ ]]; then
+        die "Could not determine available disk space in ${ORACLE_BASE}"
+    fi
 
     log_info "Required: ${required_space} MB, Available: ${available_space} MB"
+    [[ ${available_space} -ge ${required_space} ]] || die "Insufficient disk space before clone"
 
     if [[ "${DRY_RUN}" == "true" ]]; then
         log_info "[DRY-RUN] Would clone to: ${NEW_ORACLE_HOME}"
@@ -1018,7 +1186,6 @@ clone_oracle_home() {
     log_info "Starting clone operation..."
     
     if ! rsync -a \
-        --exclude='.patch_storage' \
         --exclude='rdbms/audit' \
         --exclude='rdbms/log' \
         --exclude='admin' \
@@ -1080,12 +1247,19 @@ update_opatch() {
     
     if ! unzip -q -d "${NEW_ORACLE_HOME}" "${OPATCH_ZIP}" 2>&1 | tee -a "${LOGFILE}"; then
         log_error "Failed to extract OPatch, restoring backup"
-        rm -rf "${NEW_ORACLE_HOME}/OPatch"
-        mv "${NEW_ORACLE_HOME}/OPatch.bak_${TIMESTAMP}" "${NEW_ORACLE_HOME}/OPatch"
+        rm -rf -- "${NEW_ORACLE_HOME}/OPatch"
+        mv -- "${NEW_ORACLE_HOME}/OPatch.bak_${TIMESTAMP}" "${NEW_ORACLE_HOME}/OPatch"
         return 1
     fi
 
     new_version=$(get_opatch_version "${NEW_ORACLE_HOME}")
+    if [[ ! "${new_version}" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+        log_error "Extracted OPatch is not executable or has an invalid version: ${new_version:-empty}"
+        rm -rf -- "${NEW_ORACLE_HOME}/OPatch"
+        mv -- "${NEW_ORACLE_HOME}/OPatch.bak_${TIMESTAMP}" "${NEW_ORACLE_HOME}/OPatch"
+        return 1
+    fi
+
     log_success "OPatch updated: ${current_version} -> ${new_version}"
 }
 
@@ -1096,20 +1270,27 @@ update_opatch() {
 apply_patches() {
     log_info "=== Applying Patches to New Home ==="
 
+    local original_dir="${PWD}"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "[DRY-RUN] Would run conflict analysis and apply RU ${RU_PATCH_NUM}${OJVM_PATCH_NUM:+ and OJVM ${OJVM_PATCH_NUM}}"
+        return 0
+    fi
+
     export ORACLE_HOME="${NEW_ORACLE_HOME}"
     export PATH="${NEW_ORACLE_HOME}/OPatch:${PATH}"
 
     log_info "Running conflict analysis..."
 
-    cd "${RU_PATCH_DIR}"
+    cd -- "${RU_PATCH_DIR}" || die "Could not enter RU patch directory: ${RU_PATCH_DIR}"
 
-    if ! ${NEW_ORACLE_HOME}/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph ./ 2>&1 | tee -a "${LOGFILE}"; then
+    if ! "${NEW_ORACLE_HOME}/OPatch/opatch" prereq CheckConflictAgainstOHWithDetail -ph ./ 2>&1 | tee -a "${LOGFILE}"; then
         die "Conflict check failed"
     fi
 
     log_info "Applying Release Update ${RU_PATCH_NUM}..."
 
-    if ! ${NEW_ORACLE_HOME}/OPatch/opatch apply -silent 2>&1 | tee -a "${LOGFILE}"; then
+    if ! "${NEW_ORACLE_HOME}/OPatch/opatch" apply -silent 2>&1 | tee -a "${LOGFILE}"; then
         die "RU Patch application failed"
     fi
 
@@ -1118,95 +1299,263 @@ apply_patches() {
     if [[ -n "${OJVM_PATCH_DIR:-}" ]]; then
         log_info "Applying OJVM Patch ${OJVM_PATCH_NUM}..."
 
-        cd "${OJVM_PATCH_DIR}"
+        cd -- "${OJVM_PATCH_DIR}" || die "Could not enter OJVM patch directory: ${OJVM_PATCH_DIR}"
         
-        if ! ${NEW_ORACLE_HOME}/OPatch/opatch apply -silent 2>&1 | tee -a "${LOGFILE}"; then
-            log_warn "OJVM Patch application failed (non-critical)"
+        if ! "${NEW_ORACLE_HOME}/OPatch/opatch" apply -silent 2>&1 | tee -a "${LOGFILE}"; then
+            die "OJVM Patch application failed"
         else
             log_success "OJVM Patch ${OJVM_PATCH_NUM} applied successfully"
         fi
     fi
 
     log_info "Verifying installed patches..."
-    ${NEW_ORACLE_HOME}/OPatch/opatch lspatches 2>&1 | tee -a "${LOGFILE}"
+    local installed_patches
+    if ! installed_patches=$("${NEW_ORACLE_HOME}/OPatch/opatch" lspatches 2>&1); then
+        printf '%s\n' "${installed_patches}" | tee -a "${LOGFILE}"
+        die "Could not verify installed patches"
+    fi
+    printf '%s\n' "${installed_patches}" | tee -a "${LOGFILE}"
+
+    if ! grep -Eq "^${RU_PATCH_NUM};" <<< "${installed_patches}"; then
+        die "Applied RU ${RU_PATCH_NUM} is missing from OPatch inventory"
+    fi
+    if [[ -n "${OJVM_PATCH_NUM:-}" ]] && ! grep -Eq "^${OJVM_PATCH_NUM};" <<< "${installed_patches}"; then
+        die "Applied OJVM ${OJVM_PATCH_NUM} is missing from OPatch inventory"
+    fi
+
+    cd -- "${original_dir}" || die "Could not restore working directory: ${original_dir}"
 }
 
 # =============================================================================
 # DATABASE SWITCH (DOWNTIME PHASE)
 # =============================================================================
 
+save_switch_state() {
+    local state_tmp
+    state_tmp=$(mktemp "${STATE_FILE}.tmp.XXXXXX") || return 1
+    if ! {
+        printf 'OLD_HOME\t%s\n' "${CURRENT_ORACLE_HOME}"
+        printf 'NEW_HOME\t%s\n' "${NEW_ORACLE_HOME}"
+        printf 'ORATAB_BACKUP\t%s\n' "${ORATAB_BACKUP}"
+        printf 'PHASE\t%s\n' "${PATCH_PHASE}"
+        local db
+        for db in "${DATABASES[@]}"; do
+            printf 'DATABASE\t%s\n' "${db}"
+        done
+    } > "${state_tmp}"; then
+        rm -f -- "${state_tmp}"
+        return 1
+    fi
+    mv -- "${state_tmp}" "${STATE_FILE}" || { rm -f -- "${state_tmp}"; return 1; }
+}
+
+load_switch_state() {
+    [[ -f "${STATE_FILE}" && -O "${STATE_FILE}" ]] || die "Owned rollback state not found: ${STATE_FILE}"
+
+    OLD_ORACLE_HOME=""
+    NEW_ORACLE_HOME=""
+    ORATAB_BACKUP=""
+    PATCH_PHASE=""
+    DATABASES=()
+
+    local key value
+    while IFS=$'\t' read -r key value; do
+        case "${key}" in
+            OLD_HOME) OLD_ORACLE_HOME="${value}" ;;
+            NEW_HOME) NEW_ORACLE_HOME="${value}" ;;
+            ORATAB_BACKUP) ORATAB_BACKUP="${value}" ;;
+            PHASE) PATCH_PHASE="${value}" ;;
+            DATABASE) DATABASES+=("${value}") ;;
+        esac
+    done < "${STATE_FILE}"
+
+    [[ -n "${OLD_ORACLE_HOME}" && -d "${OLD_ORACLE_HOME}" ]] || die "Old Oracle Home from state is missing"
+    [[ -n "${NEW_ORACLE_HOME}" && -d "${NEW_ORACLE_HOME}" ]] || die "New Oracle Home from state is missing"
+    [[ -n "${ORATAB_BACKUP}" && -f "${ORATAB_BACKUP}" ]] || die "oratab backup from state is missing"
+    [[ "${PATCH_PHASE}" =~ ^(SWITCHING|SWITCHED|DATAPATCH_STARTED|COMPLETE)$ ]] || die "Invalid patch phase in rollback state"
+    [[ ${#DATABASES[@]} -gt 0 ]] || die "No databases recorded in rollback state"
+}
+
+update_oratab_home() {
+    local source_file="$1"
+    local old_home="$2"
+    local new_home="$3"
+    local target_file="$4"
+
+    awk -F: -v OFS=: -v old="${old_home}" -v new="${new_home}" '$1 !~ /^[[:space:]]*#/ && $2 == old { $2 = new } { print }' "${source_file}" > "${target_file}"
+}
+
+rollback_databases() {
+    local db db_status failed=0
+
+    for db in "${DATABASES[@]}"; do
+        export ORACLE_SID="${db}"
+        export ORACLE_HOME="${NEW_ORACLE_HOME}"
+        db_status=$(get_db_status "${NEW_ORACLE_HOME}" "${db}" || true)
+
+        if [[ "${db_status}" == *"OPEN"* || "${db_status}" == *"MOUNTED"* || "${db_status}" == *"STARTED"* ]]; then
+            log_info "Stopping ${db} before rollback..."
+            if ! "${NEW_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
+whenever sqlerror exit failure
+shutdown immediate;
+exit;
+EOF
+            then
+                log_error "Immediate shutdown failed for ${db}; attempting abort"
+                if ! "${NEW_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
+whenever sqlerror exit failure
+shutdown abort;
+exit;
+EOF
+                then
+                    log_error "Failed to stop ${db}; rollback aborted before oratab restore"
+                    return 1
+                fi
+            fi
+        else
+            log_info "${db} is not running; continuing rollback"
+        fi
+    done
+
+    if ! cat -- "${ORATAB_BACKUP}" > /etc/oratab; then
+        log_error "Could not restore ${ORATAB_BACKUP}"
+        return 1
+    fi
+    log_info "Restored oratab from ${ORATAB_BACKUP}"
+
+    for db in "${DATABASES[@]}"; do
+        export ORACLE_SID="${db}"
+        export ORACLE_HOME="${OLD_ORACLE_HOME}"
+        log_info "Starting ${db} from old home (${OLD_ORACLE_HOME})..."
+
+        if ! "${OLD_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
+whenever sqlerror exit failure
+startup;
+exit;
+EOF
+        then
+            log_error "Failed to start ${db} from old home"
+            failed=1
+        else
+            log_success "Database ${db} rolled back"
+        fi
+    done
+
+    if [[ ${failed} -ne 0 ]]; then
+        return 1
+    fi
+
+    rm -f -- "${STATE_FILE}"
+    log_warn "Listener processes were not restarted automatically; verify listeners separately"
+    log_success "Rollback completed - databases running from ${OLD_ORACLE_HOME}"
+}
+
+handle_switch_failure() {
+    local reason="$1"
+    log_error "${reason}; initiating automatic rollback"
+    if rollback_databases; then
+        die "${reason}; automatic rollback completed"
+    fi
+    die "${reason}; automatic rollback incomplete, state preserved at ${STATE_FILE}"
+}
+
 switch_database() {
     log_info "=== Switching Database to New Home ==="
     log_warn "[!]  DOWNTIME STARTS NOW [!]"
 
     local downtime_start
+    local db
     downtime_start=$(date +%s)
 
-    # Read databases as array
     read_databases_from_oratab "${CURRENT_ORACLE_HOME}" DATABASES
-
     if [[ ${#DATABASES[@]} -eq 0 ]]; then
         die "No databases found in /etc/oratab for home ${CURRENT_ORACLE_HOME}"
     fi
 
     log_info "Databases to switch: ${DATABASES[*]}"
 
+    ORATAB_BACKUP="${LOGDIR}/oratab_${TIMESTAMP}.bak"
+    cp --preserve=mode,timestamps -- /etc/oratab "${ORATAB_BACKUP}" || die "Could not back up /etc/oratab"
+    OLD_ORACLE_HOME="${CURRENT_ORACLE_HOME}"
+    PATCH_PHASE="SWITCHING"
+    save_switch_state || die "Could not persist rollback state"
+
     for db in "${DATABASES[@]}"; do
         log_info "Stopping database ${db}..."
-
         export ORACLE_SID="${db}"
         export ORACLE_HOME="${CURRENT_ORACLE_HOME}"
 
-        # Stop listener for this DB
-        local listener_name
-        listener_name=$(ps -ef 2>/dev/null | grep "[t]nslsnr.*${db}" | awk '{print $9}' | head -1 || true)
-        
-        if [[ -n "${listener_name}" ]]; then
-            ${CURRENT_ORACLE_HOME}/bin/lsnrctl stop "${listener_name}" 2>&1 | tee -a "${LOGFILE}" || true
-        fi
-
-        # Shutdown database
-        if ! ${CURRENT_ORACLE_HOME}/bin/sqlplus -s / as sysdba 2>&1 | tee -a "${LOGFILE}" <<'EOF'
+        if ! "${CURRENT_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
 whenever sqlerror exit failure
 shutdown immediate;
 exit;
 EOF
         then
             log_error "Failed to shutdown ${db}, attempting abort..."
-            ${CURRENT_ORACLE_HOME}/bin/sqlplus -s / as sysdba <<'EOF'
+            if ! "${CURRENT_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
+whenever sqlerror exit failure
 shutdown abort;
 exit;
 EOF
+            then
+                handle_switch_failure "Failed to stop ${db}"
+            fi
         fi
 
         log_success "Database ${db} stopped"
     done
 
     log_info "Updating /etc/oratab..."
+    local oratab_tmp
+    if ! oratab_tmp=$(mktemp "${LOGDIR}/oratab.new.XXXXXX"); then
+        handle_switch_failure "Could not create temporary oratab"
+    fi
+    if ! update_oratab_home /etc/oratab "${CURRENT_ORACLE_HOME}" "${NEW_ORACLE_HOME}" "${oratab_tmp}"; then
+        rm -f -- "${oratab_tmp}"
+        handle_switch_failure "Could not generate updated oratab"
+    fi
+    # Write through the existing inode so root/group ownership and mode stay intact.
+    if ! cat -- "${oratab_tmp}" > /etc/oratab; then
+        rm -f -- "${oratab_tmp}"
+        handle_switch_failure "Could not install updated oratab"
+    fi
+    rm -f -- "${oratab_tmp}"
 
-    cp /etc/oratab "/etc/oratab.bak_${TIMESTAMP}"
-    sed -i "s|${CURRENT_ORACLE_HOME}|${NEW_ORACLE_HOME}|g" /etc/oratab
+    local -a switched_databases=()
+    local -A switched_set=()
+    read_databases_from_oratab "${NEW_ORACLE_HOME}" switched_databases
+    for db in "${switched_databases[@]}"; do
+        switched_set["${db}"]=1
+    done
+    if [[ ${#switched_databases[@]} -ne ${#DATABASES[@]} ]]; then
+        handle_switch_failure "oratab update validation failed"
+    fi
+    for db in "${DATABASES[@]}"; do
+        if [[ -z "${switched_set[${db}]+present}" ]]; then
+            handle_switch_failure "oratab update validation failed for ${db}"
+        fi
+    done
 
     for db in "${DATABASES[@]}"; do
         log_info "Starting database ${db} from new home..."
-
         export ORACLE_SID="${db}"
         export ORACLE_HOME="${NEW_ORACLE_HOME}"
 
-        if ! ${NEW_ORACLE_HOME}/bin/sqlplus -s / as sysdba 2>&1 | tee -a "${LOGFILE}" <<'EOF'
+        if ! "${NEW_ORACLE_HOME}/bin/sqlplus" -s / as sysdba <<'EOF' 2>&1 | tee -a "${LOGFILE}"
 whenever sqlerror exit failure
 startup;
 exit;
 EOF
         then
-            die "Failed to start ${db} from new home - ROLLBACK REQUIRED"
+            handle_switch_failure "Failed to start ${db} from new home"
         fi
 
         log_success "Database ${db} started from new home"
-
-        # Start listener
-        ${NEW_ORACLE_HOME}/bin/lsnrctl start LISTENER 2>&1 | tee -a "${LOGFILE}" || true
     done
+
+    PATCH_PHASE="SWITCHED"
+    save_switch_state || handle_switch_failure "Could not persist switched state"
+    log_warn "Listener processes are not restarted automatically; verify listener ownership and registration separately"
 
     local downtime_end downtime_duration
     downtime_end=$(date +%s)
@@ -1221,89 +1570,79 @@ EOF
 
 run_datapatch_single() {
     local db="$1"
-    
+
     export ORACLE_SID="${db}"
     export ORACLE_HOME="${NEW_ORACLE_HOME}"
-    
-    local dplock="/tmp/datapatch_${db}.lock"
-    
+
+    local dplock="${LOGDIR}/datapatch_${db}.lock"
     if [[ -f "${dplock}" ]]; then
         local lock_pid
         lock_pid=$(cat "${dplock}" 2>/dev/null || echo "")
-        if [[ -n "${lock_pid}" ]] && kill -0 "${lock_pid}" 2>/dev/null; then
-            log_warn "Datapatch for ${db} bereits aktiv (PID: ${lock_pid})"
-            return 0
+        if [[ "${lock_pid}" =~ ^[0-9]+$ ]] && kill -0 "${lock_pid}" 2>/dev/null; then
+            log_error "Datapatch for ${db} bereits aktiv (PID: ${lock_pid})"
+            return 1
         fi
     fi
-    
-    echo $$ > "${dplock}"
-    
+
+    echo "${BASHPID}" > "${dplock}"
     log_info "Running datapatch for ${db}..."
-    
-    if ${NEW_ORACLE_HOME}/OPatch/datapatch -verbose 2>&1 | \
+
+    if timeout --foreground --kill-after=60s "${DATAPATCH_TIMEOUT}" "${NEW_ORACLE_HOME}/OPatch/datapatch" -verbose 2>&1 | \
        tee "${LOGDIR}/datapatch_${db}_${TIMESTAMP}.log"; then
         log_success "Datapatch completed for ${db}"
         rm -f "${dplock}"
         return 0
     else
-        log_error "Datapatch failed for ${db}"
+        log_error "Datapatch failed or timed out for ${db}"
         rm -f "${dplock}"
         return 1
     fi
 }
 
-run_datapatch() {
-    log_info "=== Running Datapatch (Background) ==="
-
-    DATAPATCH_PIDS=()
-    local running=0
-
-    for db in "${DATABASES[@]}"; do
-        # Limit parallel processes
-        if [[ ${running} -ge ${MAX_PARALLEL_DATAPATCH} ]]; then
-            wait -n
-            ((running--))
+wait_datapatch_batch() {
+    local failed=0
+    local pid
+    for pid in "$@"; do
+        if ! wait "${pid}"; then
+            failed=1
         fi
-        
-        log_info "Starting datapatch for ${db} in background..."
-        
-        run_datapatch_single "${db}" &
-        DATAPATCH_PIDS+=($!)
-        ((running++))
     done
-
-    log_info "Datapatch running in background (PIDs: ${DATAPATCH_PIDS[*]})"
-    log_info "Monitor progress: tail -f ${LOGDIR}/datapatch_*_${TIMESTAMP}.log"
+    [[ ${failed} -eq 0 ]]
 }
 
-wait_for_datapatch() {
-    [[ ${#DATAPATCH_PIDS[@]} -eq 0 ]] && return 0
+run_datapatch() {
+    log_info "=== Running Datapatch (up to ${MAX_PARALLEL_DATAPATCH} in parallel) ==="
 
-    log_info "=== Waiting for Datapatch Completion ==="
-    
-    local timeout="${DATAPATCH_TIMEOUT}"
-    local elapsed=0
-    
-    while [[ ${elapsed} -lt ${timeout} ]]; do
-        local running=0
-        
-        for pid in "${DATAPATCH_PIDS[@]}"; do
-            if kill -0 "${pid}" 2>/dev/null; then
-                ((running++))
+    DATAPATCH_PIDS=()
+    local -a batch_pids=()
+    local failed=0
+    local db pid
+
+    for db in "${DATABASES[@]}"; do
+        log_info "Starting datapatch for ${db}..."
+        run_datapatch_single "${db}" &
+        pid=$!
+        DATAPATCH_PIDS+=("${pid}")
+        batch_pids+=("${pid}")
+
+        if [[ ${#batch_pids[@]} -ge ${MAX_PARALLEL_DATAPATCH} ]]; then
+            if ! wait_datapatch_batch "${batch_pids[@]}"; then
+                failed=1
             fi
-        done
-        
-        if [[ ${running} -eq 0 ]]; then
-            log_success "All datapatch processes completed"
-            return 0
+            batch_pids=()
         fi
-        
-        sleep 60
-        elapsed=$((elapsed + 60))
-        log_info "Datapatch still running (${running} processes)... (${elapsed}s elapsed)"
     done
-    
-    log_warn "Datapatch timeout reached - check logs manually"
+
+    if [[ ${#batch_pids[@]} -gt 0 ]] && ! wait_datapatch_batch "${batch_pids[@]}"; then
+        failed=1
+    fi
+
+    if [[ ${failed} -ne 0 ]]; then
+        add_error "One or more datapatch runs failed"
+        return 1
+    fi
+
+    log_success "All datapatch processes completed successfully"
 }
 
 # =============================================================================
@@ -1312,15 +1651,17 @@ wait_for_datapatch() {
 
 database_health_check() {
     local phase="$1"
+    local health_home="$2"
+    local db outfile failed=0
     log_info "=== Database Health Check (${phase}) ==="
-    
+
     for db in "${DATABASES[@]}"; do
         export ORACLE_SID="${db}"
-        export ORACLE_HOME="${NEW_ORACLE_HOME}"
-        
-        local outfile="${LOGDIR}/health_${db}_${phase}_${TIMESTAMP}.log"
-        
-        ${ORACLE_HOME}/bin/sqlplus -s / as sysdba > "${outfile}" 2>&1 <<'EOF'
+        export ORACLE_HOME="${health_home}"
+        outfile="${LOGDIR}/health_${db}_${phase}_${TIMESTAMP}.log"
+
+        if ! "${ORACLE_HOME}/bin/sqlplus" -s / as sysdba > "${outfile}" 2>&1 <<'EOF'
+whenever sqlerror exit failure
 set pagesize 1000 linesize 200 heading on feedback off
 col tablespace_name format a30
 col owner format a20
@@ -1333,52 +1674,92 @@ WHERE used_percent > 80;
 
 PROMPT --- Invalid Objects ---
 SELECT owner, object_type, COUNT(*)
-FROM dba_objects 
+FROM dba_objects
 WHERE status = 'INVALID'
 GROUP BY owner, object_type;
 
 PROMPT --- Recent Alerts (last 1 hour) ---
 SELECT message_text
-FROM v$diag_alert_ext
-WHERE originating_timestamp > SYSDATE - 1/24
-AND ROWNUM <= 10
-ORDER BY originating_timestamp DESC;
+FROM (
+    SELECT message_text, originating_timestamp
+    FROM v$diag_alert_ext
+    WHERE originating_timestamp > SYSDATE - 1/24
+    ORDER BY originating_timestamp DESC
+)
+WHERE ROWNUM <= 10;
 
 EXIT;
 EOF
-        log_info "Health check for ${db} saved to: ${outfile}"
+        then
+            log_error "Health check failed for ${db}; see ${outfile}"
+            add_error "Health check failed for ${db} (${phase})"
+            failed=1
+        else
+            log_info "Health check for ${db} saved to: ${outfile}"
+        fi
     done
+    [[ ${failed} -eq 0 ]]
 }
 
 validate_patch_contents() {
     log_info "=== Validating Patch Contents ==="
-    [[ ! -f "${RU_PATCH_DIR}/README.txt" ]] && log_warn "README.txt fehlt in ${RU_PATCH_DIR}"
-    [[ ! -d "${RU_PATCH_DIR}/etc/config" ]] && log_warn "Patch-Metadaten (etc/config) fehlen in ${RU_PATCH_DIR}"
-    log_success "Validation complete"
+    [[ -f "${RU_PATCH_DIR}/README.txt" ]] || die "README.txt is missing in ${RU_PATCH_DIR}"
+    [[ -d "${RU_PATCH_DIR}/etc/config" ]] || die "RU patch metadata is missing: ${RU_PATCH_DIR}/etc/config"
+    if [[ -n "${OJVM_PATCH_DIR:-}" ]]; then
+        [[ -f "${OJVM_PATCH_DIR}/README.txt" ]] || die "README.txt is missing in ${OJVM_PATCH_DIR}"
+        [[ -d "${OJVM_PATCH_DIR}/etc/config" ]] || die "OJVM patch metadata is missing: ${OJVM_PATCH_DIR}/etc/config"
+    fi
+    if [[ -n "${OPATCH_ZIP:-}" ]] && ! unzip -tq "${OPATCH_ZIP}" >/dev/null 2>&1; then
+        die "OPatch archive is corrupt or unreadable: ${OPATCH_ZIP}"
+    fi
+    log_success "Patch content validation complete"
 }
 
 # =============================================================================
 # REPORTING
 # =============================================================================
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "${value}"
+}
+
 generate_final_report() {
     local report_file="${LOGDIR}/patch_report_${TIMESTAMP}.json"
     log_info "=== Generating Final Report ==="
-    
-    # Build database array for JSON
-    local dbs_json
-    dbs_json=$(printf '"%s", ' "${DATABASES[@]}" | sed 's/, $//')
-    
+
+    local dbs_json=""
+    local db
+    for db in "${DATABASES[@]}"; do
+        if [[ -n "${dbs_json}" ]]; then
+            dbs_json+=", "
+        fi
+        dbs_json+="\"$(json_escape "${db}")\""
+    done
+
+    local host_json patch_json version_json old_home_json new_home_json ojvm_json
+    host_json=$(json_escape "$(hostname)")
+    patch_json=$(json_escape "${RU_PATCH_NUM}")
+    version_json=$(json_escape "${NEW_PATCH_VERSION}")
+    old_home_json=$(json_escape "${CURRENT_ORACLE_HOME}")
+    new_home_json=$(json_escape "${NEW_ORACLE_HOME}")
+    ojvm_json=$(json_escape "${OJVM_PATCH_NUM:-N/A}")
+
     cat > "${report_file}" <<EOF
 {
   "timestamp": "$(date -Iseconds)",
-  "host": "$(hostname)",
+  "host": "${host_json}",
   "status": "SUCCESS",
-  "patch": "${RU_PATCH_NUM}",
-  "version": "${NEW_PATCH_VERSION}",
-  "old_home": "${CURRENT_ORACLE_HOME}",
-  "new_home": "${NEW_ORACLE_HOME}",
-  "ojvm_patch": "${OJVM_PATCH_NUM:-N/A}",
+  "patch": "${patch_json}",
+  "version": "${version_json}",
+  "old_home": "${old_home_json}",
+  "new_home": "${new_home_json}",
+  "ojvm_patch": "${ojvm_json}",
   "databases": [ ${dbs_json} ]
 }
 EOF
@@ -1400,7 +1781,11 @@ post_patch_checks() {
         log_info "Validating database ${db}..."
 
         local db_status
-        db_status=$(get_db_status "${NEW_ORACLE_HOME}" "${db}")
+        if ! db_status=$(get_db_status "${NEW_ORACLE_HOME}" "${db}"); then
+            log_error "Could not query database status for ${db}"
+            add_error "Database status query failed for ${db}"
+            continue
+        fi
 
         if [[ "${db_status}" != *"OPEN"* ]]; then
             log_error "Database ${db} is not OPEN: ${db_status}"
@@ -1410,7 +1795,8 @@ post_patch_checks() {
 
         log_success "Database ${db} is OPEN"
 
-        ${NEW_ORACLE_HOME}/bin/sqlplus -s / as sysdba <<EOF | tee -a "${LOGFILE}"
+        if ! "${NEW_ORACLE_HOME}/bin/sqlplus" -s / as sysdba 2>&1 <<'EOF' | tee -a "${LOGFILE}"
+whenever sqlerror exit failure
 set pagesize 100 linesize 200
 col action_time format a30
 col action format a20
@@ -1423,11 +1809,24 @@ ORDER BY action_time DESC
 FETCH FIRST 5 ROWS ONLY;
 exit;
 EOF
+        then
+            log_error "Could not query SQL patch registry for ${db}"
+            add_error "SQL patch registry query failed for ${db}"
+        fi
 
         local invalid_count
-        invalid_count=$(get_invalid_count "${NEW_ORACLE_HOME}" "${db}")
+        if ! invalid_count=$(get_invalid_count "${NEW_ORACLE_HOME}" "${db}" | tr -d '[:space:]'); then
+            log_error "Invalid object query failed for ${db}"
+            add_error "Invalid object query failed for ${db}"
+            continue
+        fi
+        if [[ ! "${invalid_count}" =~ ^[0-9]+$ ]]; then
+            log_error "Could not determine invalid object count for ${db}: ${invalid_count}"
+            add_error "Invalid object query failed for ${db}"
+            continue
+        fi
+
         log_info "Invalid objects in ${db}: ${invalid_count}"
-        
         if [[ ${invalid_count} -gt 0 ]]; then
             log_warn "Invalid objects detected in ${db} - consider running utlrp.sql"
         fi
@@ -1440,62 +1839,26 @@ EOF
 
 rollback() {
     acquire_lock
+    load_switch_state
+    if [[ "${PATCH_PHASE}" == "DATAPATCH_STARTED" || "${PATCH_PHASE}" == "COMPLETE" ]]; then
+        die "Automatic Home rollback is blocked after datapatch began; perform a coordinated SQL patch rollback using Oracle's documented procedure"
+    fi
+    [[ -w /etc/oratab ]] || die "/etc/oratab is not writable; rollback was not started"
+    [[ -x "${OLD_ORACLE_HOME}/bin/sqlplus" && -x "${NEW_ORACLE_HOME}/bin/sqlplus" ]] || die "Required sqlplus binary is missing; rollback was not started"
     log_warn "=== INITIATING ROLLBACK ==="
+    log_warn "New home: ${NEW_ORACLE_HOME}"
+    log_warn "Old home: ${OLD_ORACLE_HOME}"
+    log_warn "Databases: ${DATABASES[*]}"
 
-    # Read databases from NEW home
-    read_databases_from_oratab "${NEW_ORACLE_HOME}" DATABASES
-
-    for db in "${DATABASES[@]}"; do
-        export ORACLE_SID="${db}"
-        export ORACLE_HOME="${NEW_ORACLE_HOME}"
-
-        log_info "Stopping ${db} from new home..."
-
-        ${NEW_ORACLE_HOME}/bin/sqlplus -s / as sysdba <<'EOF'
-shutdown immediate;
-exit;
-EOF
-    done
-
-    # Restore oratab
-    if [[ -f "/etc/oratab.bak_${TIMESTAMP}" ]]; then
-        cp "/etc/oratab.bak_${TIMESTAMP}" /etc/oratab
-        log_info "Restored oratab from backup"
-    else
-        local latest_backup
-        latest_backup=$(ls -t /etc/oratab.bak_* 2>/dev/null | head -1)
-        if [[ -n "${latest_backup}" ]]; then
-            cp "${latest_backup}" /etc/oratab
-            log_info "Restored from ${latest_backup}"
-        else
-            log_error "No oratab backup found!"
-        fi
+    if [[ "${UNATTENDED_MODE}" != "true" ]]; then
+        local confirmation
+        read -r -p "Type ROLLBACK to continue: " confirmation
+        [[ "${confirmation}" == "ROLLBACK" ]] || { log_info "Rollback cancelled"; return 0; }
     fi
 
-    local old_home
-    old_home=$(grep "^${DATABASES[0]}:" /etc/oratab 2>/dev/null | cut -d':' -f2 || echo "")
-
-    if [[ -z "${old_home}" ]]; then
-        die "Could not determine old Oracle Home from oratab"
+    if ! rollback_databases; then
+        die "Rollback incomplete; state file preserved at ${STATE_FILE}"
     fi
-
-    for db in "${DATABASES[@]}"; do
-        export ORACLE_SID="${db}"
-        export ORACLE_HOME="${old_home}"
-
-        log_info "Starting ${db} from old home (${old_home})..."
-
-        if ! ${old_home}/bin/sqlplus -s / as sysdba <<'EOF'; then
-startup;
-exit;
-EOF
-            log_error "Failed to start ${db} from old home"
-        else
-            log_success "Database ${db} rolled back"
-        fi
-    done
-
-    log_success "Rollback completed - databases running from ${old_home}"
 }
 
 # =============================================================================
@@ -1507,8 +1870,17 @@ test_mode() {
     log_info "=== TEST MODE - No Database Switch ==="
 
     check_prerequisites
-    detect_patches
+    check_supported_topology
+    select_patch
     validate_patch_contents
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        NEW_ORACLE_HOME="${ORACLE_BASE}/19_${NEW_PATCH_VERSION}_${TIMESTAMP}"
+        log_success "[DRY-RUN] Validation completed; no files, inventory, databases, or oratab were changed"
+        log_info "[DRY-RUN] Planned Oracle Home: ${NEW_ORACLE_HOME}"
+        return 0
+    fi
+
     clone_oracle_home
     update_opatch
     apply_patches
@@ -1520,7 +1892,7 @@ test_mode() {
     log_info "Next steps:"
     log_info "1. Verify patches: ${NEW_ORACLE_HOME}/OPatch/opatch lspatches"
     log_info "2. Run in PROD mode: ${SCRIPT_NAME} --prod"
-    log_info "3. In case of issues, simply delete: ${NEW_ORACLE_HOME}"
+    log_info "3. To remove the test home safely: ${SCRIPT_NAME} --cleanup ${NEW_ORACLE_HOME}"
     
     generate_final_report
 }
@@ -1533,7 +1905,10 @@ production_mode() {
 
     local skip_confirmations=false
 
-    if [[ "${force_mode}" == "--force" ]]; then
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        skip_confirmations=true
+        log_info "Running in DRY-RUN mode"
+    elif [[ "${force_mode}" == "--force" ]]; then
         skip_confirmations=true
         log_warn "Running in FORCE mode - skipping all confirmations"
     elif [[ "${UNATTENDED_MODE:-false}" == "true" ]]; then
@@ -1548,11 +1923,11 @@ production_mode() {
         echo "This script will:"
         echo "  1. Clone current Oracle Home"
         echo "  2. Apply patches to new home"
-        echo "  3. Switch databases to new home (DOWNTIME: ~2-3 minutes)"
-        echo "  4. Run datapatch in background"
-        echo "  5. Auto-cleanup old homes (older than ${AUTO_CLEANUP_DAYS} days)"
+        echo "  3. Switch databases to new home (downtime duration depends on the environment)"
+        echo "  4. Run and verify datapatch (parallel, up to ${MAX_PARALLEL_DATAPATCH})"
+        echo "  5. Preserve the previous Oracle Home for rollback"
         echo ""
-        read -p "Do you want to continue? (yes/no): " confirm
+        read -r -p "Do you want to continue? (yes/no): " confirm
 
         if [[ "${confirm}" != "yes" ]]; then
             log_info "Operation cancelled by user"
@@ -1563,7 +1938,9 @@ production_mode() {
     fi
 
     check_prerequisites
-    detect_patches
+    [[ -r /etc/oratab && -w /etc/oratab ]] || die "/etc/oratab must be readable and writable by ${REQUIRED_USER}"
+    check_supported_topology
+    select_patch
     validate_patch_contents
 
     echo ""
@@ -1573,6 +1950,13 @@ production_mode() {
     [[ -n "${OJVM_PATCH_NUM:-}" ]] && log_info "OJVM Patch: ${OJVM_PATCH_NUM}"
     [[ -n "${OPATCH_ZIP:-}" ]] && log_info "OPatch Update: $(basename "${OPATCH_ZIP}")"
     echo ""
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        NEW_ORACLE_HOME="${ORACLE_BASE}/19_${NEW_PATCH_VERSION}_${TIMESTAMP}"
+        log_success "[DRY-RUN] Production plan validated; no files, inventory, databases, or oratab were changed"
+        log_info "[DRY-RUN] Planned Oracle Home: ${NEW_ORACLE_HOME}"
+        return 0
+    fi
 
     log_info "=== PHASE 1: PREPARATION (No Downtime) ==="
     log_info "Current databases will continue running during this phase"
@@ -1589,7 +1973,9 @@ production_mode() {
 
     # Read databases for health check
     read_databases_from_oratab "${CURRENT_ORACLE_HOME}" DATABASES
-    database_health_check "pre-patch"
+    if ! database_health_check "pre-patch" "${CURRENT_ORACLE_HOME}"; then
+        die "Pre-patch health validation failed; database switch was not started"
+    fi
 
     if [[ "${skip_confirmations}" == "false" ]]; then
         log_info "Preparation complete. Ready for database switch."
@@ -1601,26 +1987,18 @@ production_mode() {
             echo "  - ${db}"
         done
         echo ""
-        echo "Expected downtime: 2-3 minutes"
+        echo "Expected downtime: environment-dependent; verify on test first"
         echo ""
-        read -p "Start DOWNTIME phase now? (yes/no): " confirm_downtime
+        read -r -p "Start DOWNTIME phase now? (yes/no): " confirm_downtime
 
         if [[ "${confirm_downtime}" != "yes" ]]; then
-            log_info "Database switch cancelled by user"
-            log_info "New home is ready at: ${NEW_ORACLE_HOME}"
-            log_info ""
-            log_info "To complete patching later, you can:"
-            log_info "  1. Manually update /etc/oratab to point to new home"
-            log_info "  2. Shutdown databases and restart from new home"
-            log_info "  3. Run datapatch manually"
-            log_info ""
-            log_info "Or delete the new home if you want to abort:"
-            log_info "  rm -rf ${NEW_ORACLE_HOME}"
+            log_info "Database switch cancelled; no database or oratab changes were made"
+            log_info "Prepared home remains registered at: ${NEW_ORACLE_HOME}"
+            log_info "To abandon it safely, run: ${SCRIPT_NAME} --cleanup ${NEW_ORACLE_HOME}"
             exit 0
         fi
     else
         log_info "FORCE/UNATTENDED mode - proceeding with database switch automatically"
-        read_databases_from_oratab "${CURRENT_ORACLE_HOME}" DATABASES
         log_info "Affected databases: ${DATABASES[*]}"
     fi
 
@@ -1633,35 +2011,40 @@ production_mode() {
     log_success "All databases switched to new home successfully"
     echo ""
 
-    log_info "=== PHASE 3: DATAPATCH (Background) ==="
-    log_info "Databases are now OPEN and available"
-    log_info "Datapatch will run in background"
+    log_info "=== PHASE 3: DATAPATCH ==="
+    log_info "Databases are OPEN; waiting for all datapatch runs to finish"
     echo ""
 
-    run_datapatch
+    PATCH_PHASE="DATAPATCH_STARTED"
+    save_switch_state || handle_switch_failure "Could not persist datapatch phase"
+    if ! run_datapatch; then
+        die "Datapatch failed or timed out; do not switch Homes blindly—follow Oracle's documented SQL patch recovery/rollback procedure"
+    fi
+    PATCH_PHASE="COMPLETE"
+    if ! save_switch_state; then
+        log_warn "Could not mark state COMPLETE; conservative rollback guard remains in effect"
+    fi
 
-    log_success "=== PHASE 3 STARTED ==="
-    log_info "Datapatch is running in background for all databases"
-    log_info "Monitor progress: tail -f ${LOGDIR}/datapatch_*_${TIMESTAMP}.log"
+    log_success "=== PHASE 3 COMPLETED ==="
     echo ""
 
     log_info "=== PHASE 4: POST-PATCH VALIDATION ==="
 
     post_patch_checks
+    check_errors || die "Post-patch validation failed"
 
     log_success "=== PHASE 4 COMPLETED ==="
     echo ""
 
-    log_info "=== PHASE 5: AUTO-CLEANUP ==="
-    log_info "Checking for old Oracle Homes to cleanup..."
+    log_info "=== PHASE 5: ROLLBACK PRESERVATION ==="
+    log_success "Previous Oracle Home preserved: ${CURRENT_ORACLE_HOME}"
+    log_info "Cleanup is intentionally manual: ${SCRIPT_NAME} --cleanup"
     echo ""
 
-    auto_cleanup
-
-    log_success "=== PHASE 5 COMPLETED ==="
-    echo ""
-
-    database_health_check "post-patch"
+    if ! database_health_check "post-patch" "${NEW_ORACLE_HOME}"; then
+        die "Final database health check failed"
+    fi
+    check_errors || die "Final health validation failed"
     generate_final_report
 
     echo ""
@@ -1674,24 +2057,24 @@ production_mode() {
     log_success "Patch Version: ${NEW_PATCH_VERSION}"
     echo ""
     log_info "Datapatch Status:"
-    log_info "  - Running in background for: ${DATABASES[*]}"
+    log_info "  - Completed successfully for: ${DATABASES[*]}"
     log_info "  - Log files: ${LOGDIR}/datapatch_*_${TIMESTAMP}.log"
     echo ""
     log_info "Next Steps:"
-    log_info "  1. Monitor datapatch completion"
-    log_info "  2. Check for invalid objects: SELECT COUNT(*) FROM dba_objects WHERE status='INVALID';"
-    log_info "  3. Verify application connectivity"
-    log_info "  4. Run full smoke tests"
+    log_info "  1. Verify listener ownership and registration"
+    log_info "  2. Check invalid objects and application connectivity"
+    log_info "  3. Run full application smoke tests"
     echo ""
-    log_info "Rollback Option:"
-    log_info "  If issues occur, you can rollback with: ${SCRIPT_NAME} --rollback"
-    log_info "  Old home is preserved for ${AUTO_CLEANUP_DAYS} days"
+    log_info "Post-datapatch rollback:"
+    log_info "  Automatic Home rollback is intentionally blocked after datapatch starts"
+    log_info "  Use Oracle's documented coordinated SQL patch rollback procedure"
+    log_info "  Old home and state metadata are preserved until explicit cleanup"
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
     # Write summary file
-    local summary_file="/oracle/autopatchinstall.log"
+    local summary_file="${ORACLE_BASE}/autopatchinstall.log"
     cat > "${summary_file}" <<EOF
 Oracle Database Patching Summary
 =================================
@@ -1715,16 +2098,16 @@ Databases Patched:
 $(for db in "${DATABASES[@]}"; do echo "  - ${db}"; done)
 
 Datapatch:
-  Status: Running in background
+  Status: COMPLETED
   Log Directory: ${LOGDIR}
 
 Detailed Log: ${LOGFILE}
 
 Next Steps:
-  - Monitor datapatch: tail -f ${LOGDIR}/datapatch_*_${TIMESTAMP}.log
+  - Verify listener ownership and registration
   - Verify invalid objects
   - Run application smoke tests
-  - Old home cleanup after ${AUTO_CLEANUP_DAYS} days
+  - Keep old home until rollback window is explicitly closed
 EOF
 
     log_info "Summary written to: ${summary_file}"
@@ -1741,7 +2124,7 @@ interactive_mode() {
     echo "  4) Cleanup old homes"
     echo "  5) Exit"
     echo ""
-    read -p "Choose option [1-5]: " choice
+    read -r -p "Choose option [1-5]: " choice
 
     case ${choice} in
         1) test_mode ;;
@@ -1767,12 +2150,12 @@ usage() {
     echo ""
     echo -e "${GREEN}OPTIONS:${NC}"
     echo "    --status            Show detailed status overview"
-    echo "    --test              Test mode (no DB switch, no downtime)"
-    echo "    --prod              Production mode (with downtime + auto-cleanup)"
+    echo "    --test              Prepare and patch a new Home; no DB switch"
+    echo "    --prod              Production mode (database downtime, no automatic cleanup)"
     echo "    --prod --force      Production mode unattended (no confirmations)"
-    echo "    --cleanup           Auto-cleanup old homes (>${AUTO_CLEANUP_DAYS} days)"
-    echo "    --cleanup HOME      Cleanup specific Oracle Home"
-    echo "    --rollback          Rollback to previous Oracle Home"
+    echo "    --cleanup           Find and confirm eligible old Homes"
+    echo "    --cleanup HOME      Detach and remove a specific eligible Oracle Home"
+    echo "    --rollback          Roll back a saved switch only before datapatch starts"
     echo "    --create-config     Create default .patchrc configuration"
     echo "    -h, -?, --help      Show this help message"
     echo ""
@@ -1807,19 +2190,18 @@ usage() {
     echo "    Oracle User: ${REQUIRED_USER}"
     echo ""
     echo -e "${GREEN}FEATURES:${NC}"
-    echo "    ✓ Out-of-Place patching (2-3 min downtime)"
-    echo "    ✓ Automatic patch detection"
+    echo "    ✓ Out-of-Place patching with measured downtime"
+    echo "    ✓ Automatic RU/OJVM classification"
     echo "    ✓ Auto-detected Oracle Inventory"
     echo "    ✓ Hostname-based patch directories"
-    echo "    ✓ Test mode for validation"
-    echo "    ✓ Unattended/Force mode"
+    echo "    ✓ Test mode without database switch"
+    echo "    ✓ Dry-run and unattended modes"
     echo "    ✓ Multi-database support"
-    echo "    ✓ Auto-cleanup old homes"
-    echo "    ✓ Parallel datapatch"
-    echo "    ✓ Fast rollback capability"
+    echo "    ✓ Guarded, explicit old-Home cleanup"
+    echo "    ✓ Parallel datapatch with result verification"
+    echo "    ✓ Persistent and automatic rollback capability"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    exit 0
 }
 
 # =============================================================================
@@ -1827,14 +2209,34 @@ usage() {
 # =============================================================================
 
 main() {
-    case "${1:-${DEFAULT_MODE}}" in
+    if [[ $# -eq 0 ]]; then
+        initialize
+        case "${DEFAULT_MODE}" in
+            interactive) interactive_mode ;;
+            test) test_mode ;;
+            prod) production_mode ;;
+        esac
+        return
+    fi
+
+    case "$1" in
         --status)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for --status" >&2; return 2; }
+            initialize
             show_status
             ;;
         --test)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for --test" >&2; return 2; }
+            initialize
             test_mode
             ;;
         --prod)
+            [[ $# -le 2 ]] || { echo "Unexpected arguments for --prod" >&2; return 2; }
+            if [[ $# -eq 2 && "$2" != "--force" ]]; then
+                echo "Unknown option for --prod: $2" >&2
+                return 2
+            fi
+            initialize
             if [[ "${2:-}" == "--force" ]]; then
                 production_mode --force
             else
@@ -1842,31 +2244,43 @@ main() {
             fi
             ;;
         --cleanup)
+            [[ $# -le 2 ]] || { echo "Unexpected arguments for --cleanup" >&2; return 2; }
+            initialize
             if [[ -n "${2:-}" ]]; then
+                acquire_lock
                 cleanup_single_home "$2"
             else
                 auto_cleanup
             fi
             ;;
         --rollback)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for --rollback" >&2; return 2; }
+            initialize
             rollback
             ;;
         --create-config)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for --create-config" >&2; return 2; }
             create_default_config
             ;;
         -h|-\?|--help)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for --help" >&2; return 2; }
             usage
             ;;
-        interactive|"")
+        interactive)
+            [[ $# -eq 1 ]] || { echo "Unexpected arguments for interactive mode" >&2; return 2; }
+            initialize
             interactive_mode
             ;;
         *)
-            echo -e "${RED}Unknown option: $1${NC}"
-            echo ""
-            usage
+            echo -e "${RED}Unknown option: $1${NC}" >&2
+            echo "" >&2
+            usage >&2
+            return 2
             ;;
     esac
 }
 
-# Run main
-main "$@"
+# Run main only when executed, not when sourced by tests.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
