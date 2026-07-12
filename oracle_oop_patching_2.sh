@@ -370,10 +370,11 @@ acquire_lock() {
 read_databases_from_oratab() {
     local oracle_home="$1"
     local -n result_array=$2
+    local oratab_file="${3:-/etc/oratab}"
     
     # shellcheck disable=SC2034 # populated through the nameref output parameter
     mapfile -t result_array < <(
-        awk -F: -v home="${oracle_home}" 'NF >= 2 && $1 ~ /^[[:alnum:]_$#]+$/ && $1 != "*" && $2 == home { print $1 }' /etc/oratab 2>/dev/null || true
+        awk -F: -v home="${oracle_home}" 'NF >= 2 && $1 !~ /^[[:space:]]*#/ && $1 ~ /^[[:alnum:]_$#]+$/ && $1 != "*" && $2 == home { print $1 }' "${oratab_file}" 2>/dev/null || true
     )
 }
 
@@ -965,7 +966,7 @@ check_prerequisites() {
     done
 
     # Check for running patch processes
-    if pgrep -f "opatch|datapatch" 2>/dev/null | grep -v $$ > /dev/null; then
+    if pgrep -f "opatch|datapatch" 2>/dev/null | grep -vFx -- "$$" > /dev/null; then
         log_warn "Other OPatch/Datapatch processes are running on this host"
     fi
 

@@ -40,6 +40,20 @@ grep -Fxq 'DB2:/oracle/19x0:Y' "${TMP}/oratab.new" || fail "similar Oracle Home 
 grep -Fxq '# DB3:/oracle/19.0:Y' "${TMP}/oratab.new" || fail "comment was changed"
 pass "oratab update is exact"
 
+# Commented-out oratab entries must never be treated as active databases.
+cat > "${TMP}/oratab.read" <<'EOF'
+DB1:/oracle/19.0:Y
+#DB2:/oracle/19.0:Y
+# DB3:/oracle/19.0:Y
+DB#4:/oracle/19.0:Y
+DB5:/oracle/other:Y
+*:/oracle/19.0:N
+EOF
+detected_databases=()
+read_databases_from_oratab "/oracle/19.0" detected_databases "${TMP}/oratab.read"
+[[ "${detected_databases[*]}" == "DB1 DB#4" ]] || fail "commented or unrelated oratab entries were included: ${detected_databases[*]}"
+pass "commented oratab databases are ignored"
+
 # Unattended patch selection must use the highest RU version, not the highest patch ID.
 PATCH_BASE_DIR="${TMP}/patches"
 mkdir -p "${PATCH_BASE_DIR}/99999999" "${PATCH_BASE_DIR}/11111111" "${PATCH_BASE_DIR}/22222222"

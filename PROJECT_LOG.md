@@ -17,6 +17,7 @@ Audit `oracle_oop_patching_2.sh` for Bash, workflow, production-safety, rollback
 - Restrict automated switching to standalone single-instance databases; reject Grid Infrastructure/Restart and Data Guard.
 - Make `--help` side-effect free and preserve explicit mode semantics.
 - Continue checking all cleanup candidates after a guarded rejection, then return a non-zero aggregate result.
+- Exclude commented-out `/etc/oratab` entries from every database walk; retain exact PID matching when excluding the current process.
 
 ### Files changed
 
@@ -33,7 +34,7 @@ Audit `oracle_oop_patching_2.sh` for Bash, workflow, production-safety, rollback
 - `bash tests/test_logic.sh`
 - `git diff --check`
 
-All commands above passed locally. The regression scripts reported 15 successful scenarios.
+All commands above passed locally. The regression scripts reported 16 successful scenarios.
 
 ### Open issue
 
